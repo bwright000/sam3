@@ -120,8 +120,11 @@ class SAM3VLBackbone(nn.Module):
         return output
 
     def forward_text(
-        self, captions, input_boxes=None, additional_text=None, device="cuda"
+        self, captions, input_boxes=None, additional_text=None, device=None
     ):
+        # Auto-detect device if not specified
+        if device is None:
+            device = next(self.parameters()).device
         return activation_ckpt_wrapper(self._forward_text_no_ack_ckpt)(
             captions=captions,
             input_boxes=input_boxes,
@@ -135,8 +138,11 @@ class SAM3VLBackbone(nn.Module):
         captions,
         input_boxes=None,
         additional_text=None,
-        device="cuda",
+        device=None,
     ):
+        # Auto-detect device if not specified
+        if device is None:
+            device = next(self.parameters()).device
         output = {}
 
         # Forward through text_encoder

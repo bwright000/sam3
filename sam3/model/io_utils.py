@@ -26,6 +26,13 @@ IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"]
 VIDEO_EXTS = [".mp4", ".mov", ".avi", ".mkv", ".webm"]
 
 
+def _to_device(tensor, offload_to_cpu=False):
+    """Move tensor to appropriate device (CUDA if available and not offloading, else CPU)."""
+    if offload_to_cpu or not torch.cuda.is_available():
+        return tensor
+    return tensor.cuda()
+
+
 def load_resource_as_video_frames(
     resource_path,
     image_size,
@@ -62,8 +69,7 @@ def load_resource_as_video_frames(
             img /= img_std
             images.append(img)
         images = torch.stack(images)
-        if not offload_video_to_cpu:
-            images = images.cuda()
+        images = _to_device(images, offload_video_to_cpu)
         return images, orig_height, orig_width
 
     is_image = (
@@ -103,10 +109,9 @@ def load_image_as_single_frame_video(
 
     img_mean = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
     img_std = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
-    if not offload_video_to_cpu:
-        images = images.cuda()
-        img_mean = img_mean.cuda()
-        img_std = img_std.cuda()
+    images = _to_device(images, offload_video_to_cpu)
+    img_mean = _to_device(img_mean, offload_video_to_cpu)
+    img_std = _to_device(img_std, offload_video_to_cpu)
     # normalize by mean and std
     images -= img_mean
     images /= img_std
@@ -200,10 +205,9 @@ def load_video_frames_from_image_folder(
         tqdm(img_paths, desc=f"frame loading (image folder) [rank={RANK}]")
     ):
         images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
-    if not offload_video_to_cpu:
-        images = images.cuda()
-        img_mean = img_mean.cuda()
-        img_std = img_std.cuda()
+    images = _to_device(images, offload_video_to_cpu)
+    img_mean = _to_device(img_mean, offload_video_to_cpu)
+    img_std = _to_device(img_std, offload_video_to_cpu)
     # normalize by mean and std
     images -= img_mean
     images /= img_std
@@ -306,10 +310,9 @@ def load_video_frames_from_video_file_using_cv2(
 
     img_mean = torch.tensor(img_mean, dtype=torch.float16).view(1, 3, 1, 1)
     img_std = torch.tensor(img_std, dtype=torch.float16).view(1, 3, 1, 1)
-    if not offload_video_to_cpu:
-        video_tensor = video_tensor.cuda()
-        img_mean = img_mean.cuda()
-        img_std = img_std.cuda()
+    video_tensor = _to_device(video_tensor, offload_video_to_cpu)
+    img_mean = _to_device(img_mean, offload_video_to_cpu)
+    img_std = _to_device(img_std, offload_video_to_cpu)
     # normalize by mean and std
     video_tensor -= img_mean
     video_tensor /= img_std
@@ -322,8 +325,7 @@ def load_dummy_video(image_size, offload_video_to_cpu, num_frames=60):
     """
     video_height, video_width = 480, 640  # dummy original video sizes
     images = torch.randn(num_frames, 3, image_size, image_size, dtype=torch.float16)
-    if not offload_video_to_cpu:
-        images = images.cuda()
+    images = _to_device(images, offload_video_to_cpu)
     return images, video_height, video_width
 
 
@@ -391,8 +393,7 @@ class AsyncImageFrameLoader:
         # normalize by mean and std
         img -= self.img_mean
         img /= self.img_std
-        if not self.offload_video_to_cpu:
-            img = img.cuda()
+        img = _to_device(img, self.offload_video_to_cpu)
         self.images[index] = img
         return img
 
@@ -504,12 +505,15 @@ class AsyncVideoFileLoaderWithTorchCodec:
     ):
         # Check and possibly infer the output device (and also get its GPU id when applicable)
         assert gpu_device is None or gpu_device.type == "cuda"
-        gpu_id = (
-            gpu_device.index
-            if gpu_device is not None and gpu_device.index is not None
-            else torch.cuda.current_device()
-        )
-        if offload_video_to_cpu:
+        if torch.cuda.is_available():
+            gpu_id = (
+                gpu_device.index
+                if gpu_device is not None and gpu_device.index is not None
+                else torch.cuda.current_device()
+            )
+        else:
+            gpu_id = 0  # placeholder when no CUDA
+        if offload_video_to_cpu or not torch.cuda.is_available():
             out_device = torch.device("cpu")
         else:
             out_device = torch.device("cuda") if gpu_device is None else gpu_device

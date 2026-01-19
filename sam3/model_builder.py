@@ -58,7 +58,7 @@ def _setup_tf32() -> None:
 _setup_tf32()
 
 
-def _create_position_encoding(precompute_resolution=None):
+def _create_position_encoding(precompute_resolution=None, device="cuda"):
     """Create position encoding for visual backbone."""
     return PositionEmbeddingSine(
         num_pos_feats=256,
@@ -66,6 +66,7 @@ def _create_position_encoding(precompute_resolution=None):
         scale=None,
         temperature=10000,
         precompute_resolution=precompute_resolution,
+        device=device,
     )
 
 
@@ -232,10 +233,10 @@ def _create_segmentation_head(compile_mode=None):
     return segmentation_head
 
 
-def _create_geometry_encoder():
+def _create_geometry_encoder(device="cuda"):
     """Create geometry encoder with all its components."""
     # Create position encoding for geometry encoder
-    geo_pos_enc = _create_position_encoding()
+    geo_pos_enc = _create_position_encoding(device=device)
     # Create CX block for fuser
     cx_block = CXBlock(
         dim=256,
@@ -499,11 +500,11 @@ def _create_text_encoder(bpe_path: str) -> VETextEncoder:
 
 
 def _create_vision_backbone(
-    compile_mode=None, enable_inst_interactivity=True
+    compile_mode=None, enable_inst_interactivity=True, device="cuda"
 ) -> Sam3DualViTDetNeck:
     """Create SAM3 visual backbone with ViT and neck."""
     # Position encoding
-    position_encoding = _create_position_encoding(precompute_resolution=1008)
+    position_encoding = _create_position_encoding(precompute_resolution=1008, device=device)
     # ViT backbone
     vit_backbone: ViT = _create_vit_backbone(compile_mode=compile_mode)
     vit_neck: Sam3DualViTDetNeck = _create_vit_neck(
@@ -552,6 +553,11 @@ def _setup_device_and_mode(model, device, eval_mode):
     """Setup model device and evaluation mode."""
     if device == "cuda":
         model = model.cuda()
+    elif device == "cpu":
+        model = model.cpu()
+    else:
+        # Handle torch.device objects or other device strings
+        model = model.to(device)
     if eval_mode:
         model.eval()
     return model
@@ -590,7 +596,7 @@ def build_sam3_image_model(
     # Create visual components
     compile_mode = "default" if compile else None
     vision_encoder = _create_vision_backbone(
-        compile_mode=compile_mode, enable_inst_interactivity=enable_inst_interactivity
+        compile_mode=compile_mode, enable_inst_interactivity=enable_inst_interactivity, device=device
     )
 
     # Create text components
@@ -613,7 +619,7 @@ def build_sam3_image_model(
     )
 
     # Create geometry encoder
-    input_geometry_encoder = _create_geometry_encoder()
+    input_geometry_encoder = _create_geometry_encoder(device=device)
     if enable_inst_interactivity:
         sam3_pvs_base = build_tracker(apply_temporal_disambiguation=False)
         inst_predictor = SAM3InteractiveImagePredictor(sam3_pvs_base)
@@ -680,12 +686,12 @@ def build_sam3_video_model(
     tracker = build_tracker(apply_temporal_disambiguation=apply_temporal_disambiguation)
 
     # Build Detector components
-    visual_neck = _create_vision_backbone()
+    visual_neck = _create_vision_backbone(device=device)
     text_encoder = _create_text_encoder(bpe_path)
     backbone = SAM3VLBackbone(scalp=1, visual=visual_neck, text=text_encoder)
     transformer = _create_sam3_transformer(has_presence_token=has_presence_token)
     segmentation_head: UniversalSegmentationHead = _create_segmentation_head()
-    input_geometry_encoder = _create_geometry_encoder()
+    input_geometry_encoder = _create_geometry_encoder(device=device)
 
     # Create main dot product scoring
     main_dot_prod_mlp = MLP(

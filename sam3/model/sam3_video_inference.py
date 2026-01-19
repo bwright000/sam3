@@ -23,8 +23,24 @@ from sam3.perflib.compile import compile_wrapper, shape_logging_wrapper
 from sam3.perflib.masks_ops import masks_to_boxes as perf_masks_to_boxes
 from torchvision.ops import masks_to_boxes
 from tqdm.auto import tqdm
+from contextlib import nullcontext
+from functools import wraps
 
 logger = get_logger(__name__)
+
+
+def cuda_autocast_if_available(dtype=torch.bfloat16):
+    """Decorator that applies torch.autocast only when CUDA is available."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if torch.cuda.is_available():
+                with torch.autocast(device_type="cuda", dtype=dtype):
+                    return func(*args, **kwargs)
+            else:
+                return func(*args, **kwargs)
+        return wrapper
+    return decorator
 
 
 class Sam3VideoInference(Sam3VideoBase):
@@ -478,9 +494,7 @@ class Sam3VideoInference(Sam3VideoBase):
 
             # slice those valid entries from the original outputs
             keep_idx = torch.nonzero(keep, as_tuple=True)[0]
-            keep_idx_gpu = keep_idx.pin_memory().to(
-                device=out_binary_masks.device, non_blocking=True
-            )
+            keep_idx_gpu = keep_idx.to(device=out_binary_masks.device)
 
             out_obj_ids = torch.index_select(out_obj_ids, 0, keep_idx)
             out_probs = torch.index_select(out_probs, 0, keep_idx)
@@ -798,7 +812,7 @@ class Sam3VideoInference(Sam3VideoBase):
         return inference_state
 
     @torch.inference_mode()
-    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    @cuda_autocast_if_available(dtype=torch.bfloat16)
     def warm_up_compilation(self):
         """
         Warm up the model by running a dummy inference to compile the model. This is
@@ -906,7 +920,7 @@ class Sam3VideoInference(Sam3VideoBase):
         )
         return frame_idx, self._postprocess_output(inference_state, out)
 
-    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    @cuda_autocast_if_available(dtype=torch.bfloat16)
     def forward(self, input: BatchedDatapoint, is_inference: bool = False):
         """This method is only used for benchmark eval (not used in the demo)."""
         # set the model to single GPU for benchmark evaluation (to be compatible with trainer)

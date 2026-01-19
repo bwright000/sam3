@@ -17,7 +17,13 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import torch
 import torch.utils.data
 import torchvision
-from decord import cpu, VideoReader
+try:
+    from decord import cpu, VideoReader
+    _HAS_DECORD = True
+except ImportError:
+    _HAS_DECORD = False
+    cpu = None
+    VideoReader = None
 from iopath.common.file_io import g_pathmgr
 from PIL import Image as PILImage
 from PIL.Image import DecompressionBombError

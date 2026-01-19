@@ -1,0 +1,35 @@
+# Requirements for SAM3 CRCD test scripts
+#
+# Install with: pip install -r scripts/requirements.txt
+#
+# For CPU-only PyTorch (smaller download):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+# For CUDA 11.8:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#
+# For CUDA 12.1:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# Core dependencies (install PyTorch first!)
+# torch>=2.0.0
+# torchvision>=0.15.0
+
+# SAM3 dependencies
+timm>=1.0.17
+numpy>=1.26,<2
+tqdm
+ftfy==6.1.1
+regex
+iopath>=0.1.10
+typing_extensions
+huggingface_hub
+
+# Image processing
+Pillow>=9.0.0
+
+# Optional: memory profiling
+psutil
+
+# Optional: visualization
+matplotlib

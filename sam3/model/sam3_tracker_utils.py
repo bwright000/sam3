@@ -6,7 +6,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from numpy.typing import NDArray
-from sam3.model.edt import edt_triton
+
+# Triton is only available on CUDA - make import conditional
+_HAS_TRITON = False
+edt_triton = None
+if torch.cuda.is_available():
+    try:
+        from sam3.model.edt import edt_triton
+        _HAS_TRITON = True
+    except ImportError:
+        pass
 
 
 def sample_box_points(
@@ -140,6 +149,8 @@ def sample_one_point_from_error_center(gt_masks, pred_masks, padding=True):
     that is, the point with the largest distance to the boundary of each error region.
     This is the RITM sampling method from https://github.com/saic-vul/ritm_interactive_segmentation/blob/master/isegm/inference/clicker.py
 
+    Uses Triton-accelerated EDT on CUDA, falls back to OpenCV on CPU.
+
     Inputs:
     - gt_masks: [B, 1, H_im, W_im] masks, dtype=torch.bool
     - pred_masks: [B, 1, H_im, W_im] masks, dtype=torch.bool or None
@@ -149,6 +160,10 @@ def sample_one_point_from_error_center(gt_masks, pred_masks, padding=True):
     - points: [B, 1, 2], dtype=torch.float, contains (x, y) coordinates of each sampled point
     - labels: [B, 1], dtype=torch.int32, where 1 means positive clicks and 0 means negative clicks
     """
+    # Fall back to slow OpenCV-based implementation when Triton is not available
+    if not _HAS_TRITON:
+        return sample_one_point_from_error_center_slow(gt_masks, pred_masks, padding)
+
     if pred_masks is None:
         pred_masks = torch.zeros_like(gt_masks)
     assert gt_masks.dtype == torch.bool and gt_masks.size(1) == 1

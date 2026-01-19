@@ -68,7 +68,10 @@ class TransformerDecoderLayer(nn.Module):
         return tensor if pos is None else tensor + pos
 
     def forward_ffn(self, tgt):
-        with torch.amp.autocast(device_type="cuda", enabled=False):
+        # Use nullcontext for non-CUDA devices to avoid autocast errors
+        from contextlib import nullcontext
+        ctx = torch.amp.autocast(device_type="cuda", enabled=False) if torch.cuda.is_available() else nullcontext()
+        with ctx:
             tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout4(tgt2)
         tgt = self.norm3(tgt)
@@ -274,8 +277,10 @@ class TransformerDecoder(nn.Module):
 
             if resolution is not None and stride is not None:
                 feat_size = resolution // stride
+                # Use CPU for initialization - will be moved to correct device later
+                init_device = "cuda" if torch.cuda.is_available() else "cpu"
                 coords_h, coords_w = self._get_coords(
-                    feat_size, feat_size, device="cuda"
+                    feat_size, feat_size, device=init_device
                 )
                 self.compilable_cord_cache = (coords_h, coords_w)
                 self.compilable_stored_size = (feat_size, feat_size)
@@ -339,6 +344,10 @@ class TransformerDecoder(nn.Module):
         ):
             # good, hitting the cache, will be compilable
             coords_h, coords_w = self.compilable_cord_cache
+            # Ensure coords are on the same device as reference_boxes (CPU compatibility)
+            if coords_h.device != reference_boxes.device:
+                coords_h = coords_h.to(reference_boxes.device)
+                coords_w = coords_w.to(reference_boxes.device)
         else:
             # cache miss, will create compilation issue
             # In case we're not compiling, we'll still rely on the dict-based cache

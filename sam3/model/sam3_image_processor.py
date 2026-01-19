@@ -14,7 +14,11 @@ from torchvision.transforms import v2
 class Sam3Processor:
     """ """
 
-    def __init__(self, model, resolution=1008, device="cuda", confidence_threshold=0.5):
+    def __init__(self, model, resolution=1008, device=None, confidence_threshold=0.5):
+        # Auto-detect device from model if not specified
+        if device is None:
+            device = next(model.parameters()).device
+            device = str(device) if hasattr(device, '__str__') else "cpu"
         self.model = model
         self.resolution = resolution
         self.device = device

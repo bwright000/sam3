@@ -47,8 +47,14 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         self.max_point_num_in_prompt_enc = max_point_num_in_prompt_enc
         self.non_overlap_masks_for_output = non_overlap_masks_for_output
 
-        self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        self.bf16_context.__enter__()  # keep using for the entire model process
+        # Use bf16 autocast only if CUDA is available
+        from contextlib import nullcontext
+        if torch.cuda.is_available():
+            self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            self.bf16_context.__enter__()  # keep using for the entire model process
+        else:
+            self.bf16_context = nullcontext()
+            self.bf16_context.__enter__()
 
         self.iter_use_prev_mask_pred = True
         self.add_all_frames_to_correct_as_cond = True
@@ -1022,7 +1028,8 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
                 )
             else:
                 # Cache miss -- we will run inference on a single image
-                image = inference_state["images"][frame_idx].cuda().float().unsqueeze(0)
+                device = inference_state.get("device", "cpu")
+                image = inference_state["images"][frame_idx].to(device=device).float().unsqueeze(0)
                 backbone_out = self.forward_image(image)
                 # Cache the most recent frame's feature (for repeated interactions with
                 # a frame; we can use an LRU cache for more frames in the future).
