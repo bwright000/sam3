@@ -168,10 +168,11 @@ def create_overlay(image: Image.Image, masks: dict, alpha: float = 0.5) -> Image
     """
     # Color palette for different prompts
     colors = {
-        "liver": (255, 0, 0),      # Red
-        "gallbladder": (0, 255, 0), # Green
-        "tool": (0, 0, 255),       # Blue
+        "reddish-brown organ": (255, 0, 0),      # Red
+        "greenish-grey organ": (0, 255, 0), # Green
+        "surgical tool": (0, 0, 255),       # Blue
         "instrument": (0, 0, 255), # Blue (alias)
+        "cloth": (255, 165, 0),               # Orange
         "default": (255, 255, 0),  # Yellow for unknown
     }
 
