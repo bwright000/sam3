@@ -63,6 +63,16 @@ def parse_args():
         nargs="+",
         help="One or more image files to process",
     )
+    input_group.add_argument(
+        "--video",
+        type=str,
+        help="Video file to process (outputs segmented video)",
+    )
+    input_group.add_argument(
+        "--frame-dir",
+        type=str,
+        help="Directory containing video frames (00000.jpg, 00001.jpg, etc.)",
+    )
 
     # Model options
     parser.add_argument(
@@ -114,6 +124,12 @@ def parse_args():
         help="Maximum number of images to process",
     )
     parser.add_argument(
+        "--fps",
+        type=int,
+        default=30,
+        help="FPS for output video (default: 30)",
+    )
+    parser.add_argument(
         "--profile-memory",
         action="store_true",
         help="Profile memory usage during inference",
@@ -154,39 +170,50 @@ def load_image(image_path: str) -> Image.Image:
     return img
 
 
-def create_overlay(image: Image.Image, masks: dict, alpha: float = 0.5) -> Image.Image:
+def create_overlay(image: Image.Image, masks: dict, alpha: float = 0.25) -> Image.Image:
     """
-    Create visualization overlay with colored masks.
+    Create visualization overlay with colored masks and smooth contours.
+
+    Uses SAM3 demo-style rendering with multi-layer contours for smooth boundaries:
+    - Alpha blending for semi-transparent mask overlay
+    - Triple-layer contours: white (7px) -> black (5px) -> color (3px)
 
     Args:
         image: Original PIL image
         masks: Dictionary of prompt -> mask tensor
-        alpha: Overlay transparency
+        alpha: Overlay transparency (default 0.25 to match SAM3 demo)
 
     Returns:
-        PIL Image with colored mask overlay
+        PIL Image with colored mask overlay and smooth contours
     """
-    # Color palette for different prompts
+    import cv2
+
+    # Color palette for different prompts (BGR for OpenCV)
     colors = {
-        "reddish-brown organ": (255, 0, 0),      # Red
-        "greenish-grey organ": (0, 255, 0), # Green
-        "surgical tool": (0, 0, 255),       # Blue
-        "instrument": (0, 0, 255), # Blue (alias)
-        "cloth": (255, 165, 0),               # Orange
-        "default": (255, 255, 0),  # Yellow for unknown
+        "reddish-brown organ": (0, 0, 255),      # Red (BGR)
+        "greenish-grey organ": (0, 255, 0),      # Green (BGR)
+        "surgical tool": (255, 0, 0),            # Blue (BGR)
+        "instrument": (255, 0, 0),               # Blue (alias)
+        "cloth": (0, 165, 255),                  # Orange (BGR)
+        "liver": (0, 0, 255),                    # Red
+        "gallbladder": (0, 255, 0),              # Green
+        "tool": (255, 0, 0),                     # Blue
+        "default": (0, 255, 255),                # Yellow (BGR)
     }
 
-    # Convert to numpy
+    # Convert to numpy (BGR for OpenCV)
     img_np = np.array(image).copy()
-    overlay = img_np.copy()
+    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    masked_frame = img_bgr.copy()
 
     for prompt, mask_data in masks.items():
         mask_tensor = mask_data.get("masks")
         if mask_tensor is None or len(mask_tensor) == 0:
             continue
 
-        # Get color for this prompt
+        # Get color for this prompt (BGR)
         color = colors.get(prompt.lower(), colors["default"])
+        color_np = np.array(color, dtype=np.uint8)
 
         # Process each mask
         for i, mask in enumerate(mask_tensor):
@@ -199,21 +226,42 @@ def create_overlay(image: Image.Image, masks: dict, alpha: float = 0.5) -> Image
 
             # Resize mask to image size if needed
             if mask.shape != (img_np.shape[0], img_np.shape[1]):
-                from PIL import Image as PILImage
-                mask_pil = PILImage.fromarray((mask * 255).astype(np.uint8))
-                mask_pil = mask_pil.resize((img_np.shape[1], img_np.shape[0]))
-                mask = np.array(mask_pil) > 127
-
-            # Apply color to mask region
-            mask_bool = mask > 0.5
-            for c in range(3):
-                overlay[:, :, c] = np.where(
-                    mask_bool,
-                    (1 - alpha) * img_np[:, :, c] + alpha * color[c],
-                    overlay[:, :, c],
+                mask = cv2.resize(
+                    mask.astype(np.float32),
+                    (img_np.shape[1], img_np.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
                 )
 
-    return Image.fromarray(overlay.astype(np.uint8))
+            # Binary mask
+            mask_bool = (mask > 0.5).astype(np.uint8)
+
+            # Alpha blending (SAM3 style: 75% original, 25% mask color)
+            curr_masked_frame = np.where(
+                mask_bool[..., None].astype(bool),
+                color_np,
+                masked_frame
+            )
+            masked_frame = cv2.addWeighted(
+                masked_frame, 1.0 - alpha,
+                curr_masked_frame, alpha,
+                0
+            )
+
+            # Draw multi-layer contours for smooth boundaries
+            contours, _ = cv2.findContours(
+                mask_bool,
+                cv2.RETR_TREE,
+                cv2.CHAIN_APPROX_NONE,
+            )
+
+            # Triple-layer contour rendering (SAM3 demo style)
+            cv2.drawContours(masked_frame, contours, -1, (255, 255, 255), 7)  # White outer
+            cv2.drawContours(masked_frame, contours, -1, (0, 0, 0), 5)        # Black middle
+            cv2.drawContours(masked_frame, contours, -1, color, 3)            # Color inner
+
+    # Convert back to RGB for PIL
+    result_rgb = cv2.cvtColor(masked_frame, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(result_rgb)
 
 
 def save_results(
@@ -268,6 +316,179 @@ def save_results(
     meta_path = output_dir / f"{stem}_results.json"
     with open(meta_path, "w") as f:
         json.dump(metadata, f, indent=2)
+
+
+def process_video(
+    wrapper,
+    video_path: str,
+    prompts: List[str],
+    output_dir: Path,
+    fps: int = 30,
+    max_frames: Optional[int] = None,
+    verbose: bool = True,
+):
+    """
+    Process a video file and create segmented output video.
+
+    Args:
+        wrapper: SAM3InferenceWrapper instance
+        video_path: Path to input video
+        prompts: List of text prompts
+        output_dir: Output directory
+        fps: Output video FPS
+        max_frames: Maximum frames to process (None for all)
+        verbose: Print progress
+    """
+    import cv2
+
+    video_path = Path(video_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Open video
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video: {video_path}")
+
+    # Get video properties
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    input_fps = cap.get(cv2.CAP_PROP_FPS)
+
+    if max_frames:
+        total_frames = min(total_frames, max_frames)
+
+    print(f"Video: {video_path.name}")
+    print(f"  Resolution: {width}x{height}")
+    print(f"  Input FPS: {input_fps:.1f}, Output FPS: {fps}")
+    print(f"  Frames to process: {total_frames}")
+
+    # Create output video writer
+    output_path = output_dir / f"{video_path.stem}_segmented.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+
+    if not out.isOpened():
+        raise ValueError(f"Could not create output video: {output_path}")
+
+    start_time = time.time()
+    frame_idx = 0
+
+    while frame_idx < total_frames:
+        ret, frame_bgr = cap.read()
+        if not ret:
+            break
+
+        # Convert BGR to RGB for PIL
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(frame_rgb)
+
+        # Run inference
+        results = wrapper.segment(image, prompts)
+
+        # Create overlay with smooth contours
+        overlay = create_overlay(image, results)
+
+        # Convert back to BGR for video writer
+        overlay_bgr = cv2.cvtColor(np.array(overlay), cv2.COLOR_RGB2BGR)
+        out.write(overlay_bgr)
+
+        frame_idx += 1
+
+        if verbose and (frame_idx % 10 == 0 or frame_idx == total_frames):
+            elapsed = time.time() - start_time
+            fps_actual = frame_idx / elapsed if elapsed > 0 else 0
+            eta = (total_frames - frame_idx) / fps_actual if fps_actual > 0 else 0
+            print(f"  Frame {frame_idx}/{total_frames} ({fps_actual:.2f} fps, ETA: {eta:.0f}s)")
+
+    cap.release()
+    out.release()
+
+    total_time = time.time() - start_time
+    print(f"\nVideo saved to: {output_path}")
+    print(f"Total time: {total_time:.1f}s ({total_frames / total_time:.2f} fps)")
+
+
+def process_frame_directory(
+    wrapper,
+    frame_dir: str,
+    prompts: List[str],
+    output_dir: Path,
+    fps: int = 30,
+    max_frames: Optional[int] = None,
+    verbose: bool = True,
+):
+    """
+    Process a directory of video frames and create segmented output video.
+
+    Args:
+        wrapper: SAM3InferenceWrapper instance
+        frame_dir: Directory containing frames (00000.jpg, 00001.jpg, etc.)
+        prompts: List of text prompts
+        output_dir: Output directory
+        fps: Output video FPS
+        max_frames: Maximum frames to process (None for all)
+        verbose: Print progress
+    """
+    import cv2
+
+    frame_path = Path(frame_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find all frames
+    frames = sorted(frame_path.glob("*.jpg"))
+    if not frames:
+        frames = sorted(frame_path.glob("*.png"))
+    if not frames:
+        raise ValueError(f"No frames found in {frame_dir}")
+
+    if max_frames:
+        frames = frames[:max_frames]
+
+    # Get dimensions from first frame
+    first_frame = cv2.imread(str(frames[0]))
+    height, width = first_frame.shape[:2]
+
+    print(f"Frame directory: {frame_path.name}")
+    print(f"  Resolution: {width}x{height}")
+    print(f"  Output FPS: {fps}")
+    print(f"  Frames to process: {len(frames)}")
+
+    # Create output video writer
+    output_path = output_dir / f"{frame_path.name}_segmented.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+
+    if not out.isOpened():
+        raise ValueError(f"Could not create output video: {output_path}")
+
+    start_time = time.time()
+
+    for frame_idx, frame_file in enumerate(frames):
+        # Load frame
+        image = Image.open(frame_file).convert("RGB")
+
+        # Run inference
+        results = wrapper.segment(image, prompts)
+
+        # Create overlay with smooth contours
+        overlay = create_overlay(image, results)
+
+        # Convert to BGR for video writer
+        overlay_bgr = cv2.cvtColor(np.array(overlay), cv2.COLOR_RGB2BGR)
+        out.write(overlay_bgr)
+
+        if verbose and ((frame_idx + 1) % 10 == 0 or frame_idx == len(frames) - 1):
+            elapsed = time.time() - start_time
+            fps_actual = (frame_idx + 1) / elapsed if elapsed > 0 else 0
+            eta = (len(frames) - frame_idx - 1) / fps_actual if fps_actual > 0 else 0
+            print(f"  Frame {frame_idx + 1}/{len(frames)} ({fps_actual:.2f} fps, ETA: {eta:.0f}s)")
+
+    out.release()
+
+    total_time = time.time() - start_time
+    print(f"\nVideo saved to: {output_path}")
+    print(f"Total time: {total_time:.1f}s ({len(frames) / total_time:.2f} fps)")
 
 
 def profile_memory():
@@ -352,7 +573,57 @@ def main():
     print(f"Output: {args.output_dir}")
     print("=" * 60)
 
-    # Get image list
+    # Load model
+    print("\nLoading SAM3 model...")
+    from scripts.model_loader import SAM3InferenceWrapper
+
+    wrapper = SAM3InferenceWrapper(
+        device=args.device,
+        checkpoint_path=args.checkpoint,
+        verbose=args.verbose,
+    )
+
+    output_dir = Path(args.output_dir)
+
+    # Handle video input
+    if args.video:
+        video_path = Path(args.video)
+        if not video_path.exists():
+            print(f"Error: Video not found: {args.video}")
+            sys.exit(1)
+
+        print(f"\nProcessing video: {video_path.name}")
+        process_video(
+            wrapper,
+            args.video,
+            prompts,
+            output_dir,
+            fps=args.fps,
+            max_frames=args.max_images,
+            verbose=args.verbose,
+        )
+        return
+
+    # Handle frame directory input
+    if args.frame_dir:
+        frame_path = Path(args.frame_dir)
+        if not frame_path.exists():
+            print(f"Error: Frame directory not found: {args.frame_dir}")
+            sys.exit(1)
+
+        print(f"\nProcessing frame directory: {frame_path.name}")
+        process_frame_directory(
+            wrapper,
+            args.frame_dir,
+            prompts,
+            output_dir,
+            fps=args.fps,
+            max_frames=args.max_images,
+            verbose=args.verbose,
+        )
+        return
+
+    # Handle image inputs
     if args.image:
         image_paths = [Path(img) for img in args.image]
         # Verify all images exist
@@ -368,19 +639,7 @@ def main():
 
     print(f"Found {len(image_paths)} image(s) to process")
 
-    # Load model
-    print("\nLoading SAM3 model...")
-    from scripts.model_loader import SAM3InferenceWrapper
-
-    wrapper = SAM3InferenceWrapper(
-        device=args.device,
-        checkpoint_path=args.checkpoint,
-        verbose=args.verbose,
-    )
-
     # Process images
-    output_dir = Path(args.output_dir)
-    total_time = 0
     success_count = 0
 
     for i, image_path in enumerate(image_paths):
