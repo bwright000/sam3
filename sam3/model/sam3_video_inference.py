@@ -29,11 +29,22 @@ from functools import wraps
 logger = get_logger(__name__)
 
 
-def device_autocast_if_available(cuda_dtype=torch.bfloat16, mps_dtype=torch.float16):
+def device_autocast_if_available(dtype=None, cuda_dtype=None, mps_dtype=None):
     """
     Decorator that applies torch.autocast based on device type.
     Priority: CUDA (bfloat16) > MPS (float16) > CPU (no autocast)
+
+    Args:
+        dtype: Default dtype for CUDA (for backwards compatibility)
+        cuda_dtype: Explicit dtype for CUDA (overrides dtype)
+        mps_dtype: Explicit dtype for MPS (defaults to float16)
     """
+    # Handle backwards compatibility: dtype parameter maps to cuda_dtype
+    if cuda_dtype is None:
+        cuda_dtype = dtype if dtype is not None else torch.bfloat16
+    if mps_dtype is None:
+        mps_dtype = torch.float16
+
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):

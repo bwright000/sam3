@@ -60,14 +60,15 @@ def parse_args():
     input_group.add_argument(
         "--image",
         type=str,
-        help="Single image file to process",
+        nargs="+",
+        help="One or more image files to process",
     )
 
     # Model options
     parser.add_argument(
         "--device",
         type=str,
-        choices=["cpu", "cuda"],
+        choices=["cpu", "cuda", "mps"],
         default="cpu",
         help="Device to run on (default: cpu)",
     )
@@ -224,7 +225,10 @@ def save_results(
 ):
     """Save segmentation results."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = image_path.stem
+    # Include parent folder name to avoid overwriting when multiple images have same name
+    # e.g., split_0/00000.jpg -> split_0_00000
+    parent_name = image_path.parent.name
+    stem = f"{parent_name}_{image_path.stem}" if parent_name else image_path.stem
 
     # Save overlay visualization
     if save_overlay:
@@ -349,9 +353,11 @@ def main():
 
     # Get image list
     if args.image:
-        image_paths = [Path(args.image)]
-        if not image_paths[0].exists():
-            print(f"Error: Image not found: {args.image}")
+        image_paths = [Path(img) for img in args.image]
+        # Verify all images exist
+        missing = [p for p in image_paths if not p.exists()]
+        if missing:
+            print(f"Error: Image(s) not found: {', '.join(str(p) for p in missing)}")
             sys.exit(1)
     else:
         image_paths = find_images(args.data_dir, args.max_images)
