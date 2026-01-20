@@ -392,3 +392,170 @@ python scripts/test_crcd_prompts.py --device cpu --image "data/split_imgs/split_
 | RAM Usage | 8-16 GB | 4-8 GB VRAM |
 
 CPU inference is significantly slower but functional for batch processing or systems without compatible GPUs.
+
+---
+
+## Apple Mac (MPS) Support - IMPLEMENTED
+
+Apple Metal Performance Shaders (MPS) support has been implemented with device priority: **CUDA > MPS > CPU**
+
+### 15. `sam3/model_builder.py` - MPS Device Detection
+
+**Change:** Added `get_default_device()` function and MPS handling in `_setup_device_and_mode()`
+
+**Why:** Auto-detect best available device with priority CUDA > MPS > CPU.
+
+```python
+# ADDED
+def get_default_device():
+    """Get the best available device with priority: CUDA > MPS > CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    else:
+        return "cpu"
+
+# UPDATED _setup_device_and_mode to handle MPS
+elif device == "mps":
+    model = model.to("mps")
+```
+
+### 16. `sam3/model/geometry_encoders.py` - Grid Sample MPS Workaround
+
+**Change:** Added MPS-specific CPU fallback for `grid_sample` operation (line ~605)
+
+**Why:** `torch.nn.functional.grid_sample` has assertion failures on MPS devices (M1/M2 Macs).
+
+```python
+# IMPLEMENTED
+if img_feats.device.type == 'mps':
+    # MPS grid_sample workaround - compute on CPU
+    img_feats_cpu = img_feats.cpu()
+    grid_cpu = grid.cpu()
+    sampled = torch.nn.functional.grid_sample(
+        img_feats_cpu, grid_cpu, align_corners=False
+    ).to(img_feats.device)
+else:
+    sampled = torch.nn.functional.grid_sample(
+        img_feats, grid, align_corners=False
+    )
+```
+
+### 17. `sam3/model/sam3_tracking_predictor.py` - MPS Autocast
+
+**Change:** Updated autocast context to support MPS with float16.
+
+**Why:** MPS doesn't support bfloat16, only float16.
+
+```python
+# IMPLEMENTED
+device_type = next(self.parameters()).device.type
+if device_type == "cuda":
+    self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+elif device_type == "mps":
+    # MPS doesn't support bfloat16, use float16 instead
+    self.bf16_context = torch.autocast(device_type="mps", dtype=torch.float16)
+else:
+    self.bf16_context = nullcontext()
+```
+
+### 18. `sam3/model/decoder.py` - MPS Autocast in FFN
+
+**Change:** Updated `forward_ffn` to detect device type and use appropriate autocast.
+
+**Why:** MPS needs its own autocast context.
+
+```python
+# IMPLEMENTED
+device_type = tgt.device.type
+if device_type == "cuda":
+    ctx = torch.amp.autocast(device_type="cuda", enabled=False)
+elif device_type == "mps":
+    ctx = torch.amp.autocast(device_type="mps", enabled=False)
+else:
+    ctx = nullcontext()
+```
+
+### 19. `sam3/model/sam3_video_inference.py` - Device-Aware Autocast Decorator
+
+**Change:** Replaced `cuda_autocast_if_available` with `device_autocast_if_available` supporting MPS.
+
+**Why:** The decorator needs to handle CUDA, MPS, and CPU appropriately.
+
+```python
+# IMPLEMENTED
+def device_autocast_if_available(cuda_dtype=torch.bfloat16, mps_dtype=torch.float16):
+    """
+    Decorator that applies torch.autocast based on device type.
+    Priority: CUDA (bfloat16) > MPS (float16) > CPU (no autocast)
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            device_type = "cpu"
+            if args and hasattr(args[0], 'parameters'):
+                device_type = next(args[0].parameters()).device.type
+
+            if device_type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=cuda_dtype):
+                    return func(*args, **kwargs)
+            elif device_type == "mps":
+                with torch.autocast(device_type="mps", dtype=mps_dtype):
+                    return func(*args, **kwargs)
+            else:
+                return func(*args, **kwargs)
+        return wrapper
+    return decorator
+```
+
+### 20. `scripts/device_config.py` - MPS Configuration Support
+
+**Change:** Added MPS detection and configuration throughout the module.
+
+**Why:** Scripts need to auto-detect and configure MPS devices.
+
+```python
+# ADDED
+def is_mps_available() -> bool:
+    """Check if MPS (Apple Metal Performance Shaders) is available."""
+    return hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+
+def get_default_device() -> str:
+    """Get the best available device with priority: CUDA > MPS > CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif is_mps_available():
+        return "mps"
+    else:
+        return "cpu"
+
+# MPS configuration in configure_device():
+elif selected_device == "mps":
+    dtype = torch.float16  # MPS doesn't support bfloat16
+    use_compile = False    # torch.compile has limited MPS support
+    use_half = True
+```
+
+### Summary: MPS Changes Implemented
+
+| File | Change |
+|------|--------|
+| `model_builder.py` | ✅ `get_default_device()` with MPS support |
+| `geometry_encoders.py` | ✅ grid_sample CPU fallback for MPS |
+| `sam3_tracking_predictor.py` | ✅ float16 autocast for MPS |
+| `decoder.py` | ✅ MPS-aware autocast context |
+| `sam3_video_inference.py` | ✅ Device-aware autocast decorator |
+| `scripts/device_config.py` | ✅ Full MPS configuration support |
+
+### MPS Testing Command (Mac)
+
+```bash
+python scripts/test_crcd_prompts.py --device mps --image "data/split_imgs/split_0/00000.jpg" --prompts "liver,gallbladder,tool"
+```
+
+### Known MPS Limitations
+
+1. **Video inference** - Not yet working (data loading issues per PR #173)
+2. **Batching** - May cause OOM on devices with limited unified memory
+3. **Performance** - May not be faster than CPU on some operations due to CPU fallbacks

@@ -47,11 +47,17 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         self.max_point_num_in_prompt_enc = max_point_num_in_prompt_enc
         self.non_overlap_masks_for_output = non_overlap_masks_for_output
 
-        # Use bf16 autocast only if CUDA is available
+        # Use autocast based on device type (priority: CUDA > MPS > CPU)
+        # CUDA supports bfloat16, MPS only supports float16, CPU uses no autocast
         from contextlib import nullcontext
-        if torch.cuda.is_available():
+        device_type = next(self.parameters()).device.type
+        if device_type == "cuda":
             self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
             self.bf16_context.__enter__()  # keep using for the entire model process
+        elif device_type == "mps":
+            # MPS doesn't support bfloat16, use float16 instead
+            self.bf16_context = torch.autocast(device_type="mps", dtype=torch.float16)
+            self.bf16_context.__enter__()
         else:
             self.bf16_context = nullcontext()
             self.bf16_context.__enter__()

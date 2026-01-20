@@ -29,18 +29,38 @@ from functools import wraps
 logger = get_logger(__name__)
 
 
-def cuda_autocast_if_available(dtype=torch.bfloat16):
-    """Decorator that applies torch.autocast only when CUDA is available."""
+def device_autocast_if_available(cuda_dtype=torch.bfloat16, mps_dtype=torch.float16):
+    """
+    Decorator that applies torch.autocast based on device type.
+    Priority: CUDA (bfloat16) > MPS (float16) > CPU (no autocast)
+    """
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            if torch.cuda.is_available():
-                with torch.autocast(device_type="cuda", dtype=dtype):
+            # Try to detect device from self (first arg for methods)
+            device_type = "cpu"
+            if args and hasattr(args[0], 'device'):
+                device_type = args[0].device.type
+            elif args and hasattr(args[0], 'parameters'):
+                try:
+                    device_type = next(args[0].parameters()).device.type
+                except StopIteration:
+                    pass
+
+            if device_type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=cuda_dtype):
+                    return func(*args, **kwargs)
+            elif device_type == "mps":
+                with torch.autocast(device_type="mps", dtype=mps_dtype):
                     return func(*args, **kwargs)
             else:
                 return func(*args, **kwargs)
         return wrapper
     return decorator
+
+
+# Backwards compatible alias
+cuda_autocast_if_available = device_autocast_if_available
 
 
 class Sam3VideoInference(Sam3VideoBase):

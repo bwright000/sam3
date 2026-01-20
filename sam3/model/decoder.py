@@ -68,9 +68,15 @@ class TransformerDecoderLayer(nn.Module):
         return tensor if pos is None else tensor + pos
 
     def forward_ffn(self, tgt):
-        # Use nullcontext for non-CUDA devices to avoid autocast errors
+        # Use autocast based on device type (priority: CUDA > MPS > CPU)
         from contextlib import nullcontext
-        ctx = torch.amp.autocast(device_type="cuda", enabled=False) if torch.cuda.is_available() else nullcontext()
+        device_type = tgt.device.type
+        if device_type == "cuda":
+            ctx = torch.amp.autocast(device_type="cuda", enabled=False)
+        elif device_type == "mps":
+            ctx = torch.amp.autocast(device_type="mps", enabled=False)
+        else:
+            ctx = nullcontext()
         with ctx:
             tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout4(tgt2)

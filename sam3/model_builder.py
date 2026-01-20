@@ -549,12 +549,24 @@ def _load_checkpoint(model, checkpoint_path):
         )
 
 
+def get_default_device():
+    """Get the best available device with priority: CUDA > MPS > CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    else:
+        return "cpu"
+
+
 def _setup_device_and_mode(model, device, eval_mode):
     """Setup model device and evaluation mode."""
     if device == "cuda":
         model = model.cuda()
     elif device == "cpu":
         model = model.cpu()
+    elif device == "mps":
+        model = model.to("mps")
     else:
         # Handle torch.device objects or other device strings
         model = model.to(device)
@@ -565,7 +577,7 @@ def _setup_device_and_mode(model, device, eval_mode):
 
 def build_sam3_image_model(
     bpe_path=None,
-    device="cuda" if torch.cuda.is_available() else "cpu",
+    device=None,
     eval_mode=True,
     checkpoint_path=None,
     load_from_HF=True,
@@ -578,7 +590,7 @@ def build_sam3_image_model(
 
     Args:
         bpe_path: Path to the BPE tokenizer vocabulary
-        device: Device to load the model on ('cuda' or 'cpu')
+        device: Device to load the model on ('cuda', 'mps', or 'cpu'). If None, auto-detects best available.
         eval_mode: Whether to set the model to evaluation mode
         checkpoint_path: Optional path to model checkpoint
         enable_segmentation: Whether to enable segmentation head
@@ -588,6 +600,10 @@ def build_sam3_image_model(
     Returns:
         A SAM3 image model
     """
+    # Auto-detect device if not specified (priority: CUDA > MPS > CPU)
+    if device is None:
+        device = get_default_device()
+
     if bpe_path is None:
         bpe_path = pkg_resources.resource_filename(
             "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"

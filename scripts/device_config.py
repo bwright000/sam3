@@ -4,7 +4,10 @@ Device configuration module for SAM3 on limited hardware.
 Supports:
 - CPU mode (primary for limited hardware)
 - CUDA mode with memory optimizations
+- MPS mode (Apple Silicon)
 - Automatic hardware detection and configuration
+
+Device Priority: CUDA > MPS > CPU
 """
 
 import sys
@@ -25,6 +28,21 @@ class DeviceConfig:
     ram_gb: Optional[float]
 
 
+def is_mps_available() -> bool:
+    """Check if MPS (Apple Metal Performance Shaders) is available."""
+    return hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+
+
+def get_default_device() -> str:
+    """Get the best available device with priority: CUDA > MPS > CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif is_mps_available():
+        return "mps"
+    else:
+        return "cpu"
+
+
 def get_system_info() -> dict:
     """Get system hardware information."""
     info = {
@@ -33,6 +51,7 @@ def get_system_info() -> dict:
         "cuda_device_name": None,
         "cuda_vram_gb": None,
         "cuda_compute_capability": None,
+        "mps_available": is_mps_available(),
     }
 
     if info["cuda_available"] and info["cuda_device_count"] > 0:
@@ -53,14 +72,18 @@ def print_system_info():
     print("=" * 50)
     print(f"PyTorch version: {torch.__version__}")
     print(f"CUDA available: {info['cuda_available']}")
+    print(f"MPS available: {info['mps_available']}")
 
     if info["cuda_available"]:
         print(f"CUDA device: {info['cuda_device_name']}")
         print(f"CUDA VRAM: {info['cuda_vram_gb']:.2f} GB")
         print(f"Compute capability: {info['cuda_compute_capability']}")
+    elif info["mps_available"]:
+        print("Apple Metal Performance Shaders (MPS) detected")
     else:
         print("Running in CPU-only mode")
 
+    print(f"Default device: {get_default_device()}")
     print("=" * 50)
 
 
@@ -73,32 +96,46 @@ def configure_device(
     Configure device settings based on hardware capabilities.
 
     Args:
-        device: Explicit device selection ('cpu' or 'cuda')
-        force_cpu: Force CPU mode regardless of CUDA availability
+        device: Explicit device selection ('cpu', 'cuda', or 'mps')
+        force_cpu: Force CPU mode regardless of other device availability
         verbose: Print configuration details
 
     Returns:
         DeviceConfig with optimal settings for the hardware
+
+    Device Priority: CUDA > MPS > CPU
     """
     info = get_system_info()
 
-    # Determine device
+    # Determine device with priority: CUDA > MPS > CPU
     if force_cpu or device == "cpu":
         selected_device = "cpu"
     elif device == "cuda" and info["cuda_available"]:
         selected_device = "cuda"
+    elif device == "mps" and info["mps_available"]:
+        selected_device = "mps"
     elif device is None:
-        selected_device = "cuda" if info["cuda_available"] else "cpu"
+        # Auto-detect best available device
+        selected_device = get_default_device()
     else:
+        # Fallback to CPU if requested device not available
         selected_device = "cpu"
 
-    # Configure dtype and optimizations
+    # Configure dtype and optimizations based on device
+    vram = None
+
     if selected_device == "cpu":
         # CPU mode: use float32, no compile (not beneficial on CPU)
         dtype = torch.float32
         use_compile = False
         use_half = False
-        vram = None
+
+    elif selected_device == "mps":
+        # MPS mode (Apple Silicon): use float16 (bfloat16 not supported)
+        dtype = torch.float16
+        use_compile = False  # torch.compile has limited MPS support
+        use_half = True
+
     else:
         # CUDA mode: configure based on VRAM
         vram = info["cuda_vram_gb"]
@@ -145,7 +182,7 @@ def print_device_config(config: DeviceConfig):
     print(f"torch.compile: {'enabled' if config.use_compile else 'disabled'}")
     print(f"Half precision: {'enabled' if config.use_half_precision else 'disabled'}")
 
-    if config.vram_gb:
+    if config.device == "cuda" and config.vram_gb:
         print(f"VRAM available: {config.vram_gb:.2f} GB")
 
         # Memory warning for SAM3
@@ -154,6 +191,12 @@ def print_device_config(config: DeviceConfig):
             print("*** Consider using CPU mode for better stability ***")
         elif config.vram_gb < 16:
             print("\nNote: Limited VRAM - may experience OOM on large images")
+
+    elif config.device == "mps":
+        print("\nRunning in MPS mode (Apple Silicon)")
+        print("Note: Some operations may fall back to CPU")
+        print("Note: Using float16 (bfloat16 not supported on MPS)")
+
     else:
         print("\nRunning in CPU mode")
         print("Note: Inference will be slow (~30-120 seconds per image)")
@@ -191,3 +234,10 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         print("\nTesting CUDA configuration:")
         config_cuda = configure_device(device="cuda")
+
+    if is_mps_available():
+        print("\nTesting MPS configuration:")
+        config_mps = configure_device(device="mps")
+
+    print("\nAuto-detected best device:")
+    config_auto = configure_device(device=None)
