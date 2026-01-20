@@ -154,3 +154,5 @@ Thumbs.db
 
 # data
 .data
+*.json
+*.jpg
