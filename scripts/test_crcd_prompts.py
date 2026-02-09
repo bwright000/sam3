@@ -190,8 +190,8 @@ def create_overlay(image: Image.Image, masks: dict, alpha: float = 0.25) -> Imag
 
     # Color palette for different prompts (BGR for OpenCV)
     colors = {
-        "reddish-brown organ": (0, 0, 255),      # Red (BGR)
-        "greenish-grey organ": (0, 255, 0),      # Green (BGR)
+        "brown leather object": (0, 0, 255),      # Red (BGR)
+        "greenish-grey leather object": (0, 255, 0),      # Green (BGR)
         "surgical tool": (255, 0, 0),            # Blue (BGR)
         "instrument": (255, 0, 0),               # Blue (alias)
         "cloth": (0, 165, 255),                  # Orange (BGR)
