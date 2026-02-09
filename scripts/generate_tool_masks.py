@@ -7,8 +7,6 @@ Two modes:
   2. Snippet mode (Segments clips): Run SAM3 text prompts on short video
      snippets to segment liver, gallbladder, and tools.
 
-Works on CPU or GTX 970 (4GB VRAM) by processing one image at a time.
-
 Usage:
     # --- Snippet mode (recommended) ---
     # Process a single snippet
