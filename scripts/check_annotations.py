@@ -140,7 +140,12 @@ class COCOAnnotationLoader:
             try:
                 offset = int(stem)
             except ValueError:
-                continue
+                # C_1 train.json has broken file_name like "./split_14/" (no filename).
+                # For that dataset image_id = split*120+offset, so recover offset from id.
+                if img_id // 120 == split_num:
+                    offset = img_id % 120
+                else:
+                    continue
             video_frame = split_num * 120 + offset
             self._frame_to_all_ids[video_frame].append(img_id)
         # Backward-compat: single image_id mapping (first per frame)
