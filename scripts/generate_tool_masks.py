@@ -1081,8 +1081,8 @@ def main():
     snippet_group.add_argument(
         "--prompts",
         nargs="+",
-        default=["tool", "cloth"],
-        help="Text prompts for SAM3 (default: tool cloth)",
+        default=["tool"],
+        help="Text prompts for SAM3 (default: tool)",
     )
 
     # --- Box-prompt mode args ---

@@ -1,10 +1,9 @@
 """
-Generate tool/cloth segmentation masks using SAM3 Video Mode.
+Generate tool segmentation masks using SAM3 Video Mode.
 
-Runs separate video sessions per prompt (default: "tool" and "cloth") so each
+Runs separate video sessions per prompt (default: "tool") so each
 category gets its own tracked masklets and distinct overlay color:
   - tool  → blue
-  - cloth → yellow
   - liver (GT) → red
   - gallbladder (GT) → green
 
@@ -18,13 +17,13 @@ This script is GPU-optimized (A100 recommended). The existing image-mode
 pipeline (generate_tool_masks.py) is unchanged and still usable.
 
 Usage:
-    # Process a single snippet (default prompts: tool cloth)
+    # Process a single snippet (default prompt: tool)
     python scripts/generate_tool_masks_video.py \\
         --segments-dir data/Segments --episode C_1 --snippet 1
 
     # Custom prompts
     python scripts/generate_tool_masks_video.py \\
-        --segments-dir data/Segments --episode C_1 --prompts tool cloth gauze
+        --segments-dir data/Segments --episode C_1 --prompts tool gauze
 
     # With GT tissue subtraction
     python scripts/generate_tool_masks_video.py \\
@@ -70,8 +69,11 @@ from scripts.generate_tool_masks import (
 # SAM3 video predictor
 from sam3.model.sam3_video_predictor import Sam3VideoPredictor
 
-# Extend color palette: "tool" already blue, add "cloth" as yellow
-CATEGORY_COLORS["cloth"] = (0, 255, 255)  # Yellow (BGR)
+# Color palette: "tool" already blue from generate_tool_masks.py
+
+# Tissue categories for GT and propagation
+TISSUE_CATEGORIES = ["liver", "gallbladder"]
+GT_CAT_MAP = {"Liver": "liver", "Gallbladder": "gallbladder"}
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +217,234 @@ def _convert_video_output(outputs, frame_path, prompt, min_area):
 
 
 # ---------------------------------------------------------------------------
+# Tissue segmentation: GT loading + SAM3 propagation
+# ---------------------------------------------------------------------------
+
+def _add_gt_tissue_to_results(all_results, frame_files, annotation_loader):
+    """
+    Add GT tissue masks (liver, gallbladder) to per-frame results.
+
+    For each frame, checks if GT annotations exist. If so, converts them to
+    COCO polygon format and adds to the frame's masks dict with
+    source="ground_truth". Returns set of frame indices that have GT.
+
+    Args:
+        all_results: list of per-frame result dicts (modified in-place)
+        frame_files: sorted list of frame file paths
+        annotation_loader: COCOAnnotationLoader with GT tissue masks
+
+    Returns:
+        gt_frame_indices: set of frame indices (into all_results) that have GT
+    """
+    gt_frame_indices = set()
+
+    for i, (result, fpath) in enumerate(zip(all_results, frame_files)):
+        frame_num = int(fpath.stem.split("_")[1])
+        gt_masks = annotation_loader.get_frame_masks_by_frame_num(frame_num)
+
+        if gt_masks is None:
+            continue
+
+        h, w = result["height"], result["width"]
+        if h == 0 or w == 0:
+            # Frame dimensions not yet set (no tool masks found) — read from image
+            img = cv2.imread(str(fpath))
+            if img is not None:
+                h, w = img.shape[:2]
+                result["height"] = h
+                result["width"] = w
+
+        has_tissue = False
+        for gt_cat, color_key in GT_CAT_MAP.items():
+            if gt_cat not in gt_masks:
+                continue
+            mask = gt_masks[gt_cat].astype(np.uint8)
+            area = float(mask.sum())
+            if area == 0:
+                continue
+
+            polygons = mask_to_coco_polygons(mask * 255)
+            if not polygons:
+                continue
+
+            ys, xs = np.where(mask > 0)
+            bbox = [float(xs.min()), float(ys.min()),
+                    float(xs.max() - xs.min()), float(ys.max() - ys.min())]
+
+            result["masks"][color_key] = [{
+                "segmentation": polygons,
+                "area": area,
+                "bbox": bbox,
+                "source": "ground_truth",
+            }]
+            has_tissue = True
+
+        if has_tissue:
+            gt_frame_indices.add(i)
+
+    return gt_frame_indices
+
+
+def propagate_tissue_masks(
+    predictor,
+    frames_dir,
+    frame_files,
+    effective_frames,
+    annotation_loader,
+    gt_frame_indices,
+    all_results,
+    min_area=500,
+):
+    """
+    Use SAM3 video propagation to fill tissue masks for frames without GT.
+
+    Starts a SAM3 video session, adds mask prompts at all GT frames, then
+    propagates bidirectionally. Only collects output for non-GT frames.
+
+    Args:
+        predictor: Sam3VideoPredictor instance
+        frames_dir: Path to frames_left/ directory
+        frame_files: sorted list of frame file paths
+        effective_frames: number of frames to process
+        annotation_loader: COCOAnnotationLoader with GT tissue masks
+        gt_frame_indices: set of frame indices that already have GT
+        all_results: list of per-frame result dicts (modified in-place)
+        min_area: minimum mask area to keep
+
+    Returns:
+        Number of frames filled via propagation.
+    """
+    # Identify frames needing propagation
+    need_propagation = set(range(effective_frames)) - gt_frame_indices
+    if not need_propagation:
+        return 0
+
+    print(f"\n  Tissue propagation: {len(need_propagation)} frames need SAM3 fill "
+          f"({len(gt_frame_indices)} have GT)")
+
+    # Category name -> SAM3 object ID mapping
+    tissue_cats = {"Liver": 1, "Gallbladder": 2}
+
+    # Start SAM3 video session
+    session = predictor.start_session(resource_path=str(frames_dir))
+    sid = session["session_id"]
+    inference_state = session.get("inference_state")
+
+    # Add mask prompts at every GT frame
+    prompts_added = 0
+    for fidx in sorted(gt_frame_indices):
+        fpath = frame_files[fidx]
+        frame_num = int(fpath.stem.split("_")[1])
+        gt_masks = annotation_loader.get_frame_masks_by_frame_num(frame_num)
+        if gt_masks is None:
+            continue
+
+        h = all_results[fidx]["height"]
+        w = all_results[fidx]["width"]
+
+        for gt_cat, obj_id in tissue_cats.items():
+            if gt_cat not in gt_masks:
+                continue
+            mask_np = gt_masks[gt_cat].astype(np.uint8)
+            if mask_np.sum() == 0:
+                continue
+
+            mask_tensor = torch.from_numpy(mask_np).float()
+
+            try:
+                if inference_state is not None:
+                    predictor.tracker.add_new_mask(
+                        inference_state=inference_state,
+                        frame_idx=fidx,
+                        obj_id=obj_id,
+                        mask=mask_tensor,
+                    )
+                else:
+                    predictor.add_new_mask(
+                        session_id=sid,
+                        frame_idx=fidx,
+                        obj_id=obj_id,
+                        mask=mask_tensor,
+                    )
+                prompts_added += 1
+            except Exception as e:
+                print(f"    WARNING: Failed to add tissue mask at frame {fidx}: {e}")
+
+    if prompts_added == 0:
+        print("    No tissue mask prompts added — skipping propagation")
+        predictor.close_session(session_id=sid)
+        return 0
+
+    print(f"    Added {prompts_added} mask prompts across "
+          f"{len(gt_frame_indices)} GT frames")
+
+    # Reverse lookup: obj_id -> lowercase category key
+    obj_id_to_key = {1: "liver", 2: "gallbladder"}
+
+    # Propagate through all frames
+    filled = 0
+    t0 = time.time()
+
+    for response in predictor.propagate_in_video(
+        session_id=sid,
+        propagation_direction="both",
+    ):
+        frame_idx = response["frame_index"]
+        if frame_idx >= effective_frames:
+            continue
+        # Only collect output for frames WITHOUT GT
+        if frame_idx not in need_propagation:
+            continue
+
+        outputs = response["outputs"]
+        obj_ids = outputs.get("out_obj_ids", [])
+        binary_masks = outputs.get("out_binary_masks", np.empty((0,)))
+
+        h = all_results[frame_idx]["height"]
+        w = all_results[frame_idx]["width"]
+
+        frame_filled = False
+        for i, oid in enumerate(obj_ids):
+            cat_key = obj_id_to_key.get(int(oid))
+            if cat_key is None:
+                continue
+
+            mask_np = binary_masks[i]
+            if isinstance(mask_np, torch.Tensor):
+                mask_np = mask_np.cpu().numpy()
+            mask_uint8 = (mask_np > 0.5).astype(np.uint8)
+            area = float(mask_uint8.sum())
+            if area < min_area:
+                continue
+
+            polygons = mask_to_coco_polygons(mask_uint8 * 255)
+            if not polygons:
+                continue
+
+            ys, xs = np.where(mask_uint8 > 0)
+            bbox = [float(xs.min()), float(ys.min()),
+                    float(xs.max() - xs.min()), float(ys.max() - ys.min())]
+
+            all_results[frame_idx]["masks"][cat_key] = [{
+                "segmentation": polygons,
+                "area": area,
+                "bbox": bbox,
+                "source": "sam3_propagated",
+            }]
+            frame_filled = True
+
+        if frame_filled:
+            filled += 1
+
+    elapsed = time.time() - t0
+    predictor.close_session(session_id=sid)
+    print(f"    Tissue propagation done: {filled}/{len(need_propagation)} "
+          f"frames filled in {elapsed:.1f}s")
+
+    return filled
+
+
+# ---------------------------------------------------------------------------
 # Keyframe selection and session helpers
 # ---------------------------------------------------------------------------
 
@@ -222,6 +452,8 @@ def _select_keyframes(effective_frames, num_keyframes):
     """Select evenly-spaced keyframe indices across the video."""
     if num_keyframes <= 1:
         return [0]
+    # Cap keyframes to not exceed frame count
+    num_keyframes = min(num_keyframes, effective_frames)
     step = effective_frames / num_keyframes
     return [int(i * step) for i in range(num_keyframes)]
 
@@ -409,7 +641,7 @@ def process_snippet_video(
     """
     Process a snippet using SAM3 video mode with separate prompts.
 
-    Runs a separate video session per prompt (e.g. "tool", "cloth") so each
+    Runs a separate video session per prompt (e.g. "tool") so each
     category gets its own tracked masklets and distinct overlay color.
 
     Supports multi-keyframe prompting, bidirectional propagation, and
@@ -533,11 +765,32 @@ def process_snippet_video(
         )
         print(f"  GT subtraction cleaned {cleaned} frames")
 
+    # --- Tissue segmentation: GT + SAM3 propagation ---
+    if annotation_loader:
+        print(f"\n  Adding tissue segmentation (GT + propagation)...")
+        gt_indices = _add_gt_tissue_to_results(
+            all_results, processed_frame_files, annotation_loader
+        )
+        print(f"  GT tissue found for {len(gt_indices)}/{len(all_results)} frames")
+
+        # Propagate tissue through frames without GT
+        if len(gt_indices) < len(all_results) and len(gt_indices) > 0:
+            propagate_tissue_masks(
+                predictor, frames_dir, frame_files, effective_frames,
+                annotation_loader, gt_indices, all_results,
+                min_area=500,
+            )
+        elif len(gt_indices) == 0:
+            print("  WARNING: No GT tissue annotations found — tissue masks unavailable")
+
     # --- Render overlays ---
-    print(f"  Rendering overlays...")
+    # Include tissue categories in overlay rendering
+    all_prompts = prompts + [tc for tc in TISSUE_CATEGORIES
+                             if any(tc in r["masks"] for r in all_results)]
+    print(f"  Rendering overlays (categories: {all_prompts})...")
     for i, (result, fpath) in enumerate(zip(all_results, processed_frame_files)):
         _, overlay, _ = _render_overlay_from_results(
-            fpath, result, prompts, annotation_loader
+            fpath, result, all_prompts, annotation_loader=None
         )
         out_path = overlays_dir / f"{fpath.stem}.jpg"
         cv2.imwrite(str(out_path), overlay)
@@ -553,6 +806,7 @@ def process_snippet_video(
             "episode": episode,
             "snippet_id": snippet_id,
             "prompts": prompts,
+            "tissue_categories": TISSUE_CATEGORIES,
             "mode": "video",
             "num_frames": len(all_results),
             "inference_time_s": round(inference_time, 1),
@@ -564,14 +818,27 @@ def process_snippet_video(
     total_time = time.time() - t0
     print(f"\n  {snippet_id} done: {len(all_results)} frames in {total_time:.1f}s "
           f"({total_time/max(len(all_results),1):.1f}s/frame)")
-    for prompt in prompts:
-        total_masks = sum(len(r["masks"].get(prompt, [])) for r in all_results)
-        frames_with = sum(1 for r in all_results if len(r["masks"].get(prompt, [])) > 0)
-        color_name = {(255, 128, 0): "blue", (0, 255, 255): "yellow"}.get(
-            CATEGORY_COLORS.get(prompt, DEFAULT_COLOR), "?"
+    for cat in prompts + TISSUE_CATEGORIES:
+        total_masks = sum(len(r["masks"].get(cat, [])) for r in all_results)
+        frames_with = sum(1 for r in all_results if len(r["masks"].get(cat, [])) > 0)
+        if total_masks == 0:
+            continue
+        # Count GT vs propagated for tissue
+        gt_count = sum(1 for r in all_results
+                       for m in r["masks"].get(cat, [])
+                       if m.get("source") == "ground_truth")
+        prop_count = sum(1 for r in all_results
+                         for m in r["masks"].get(cat, [])
+                         if m.get("source") == "sam3_propagated")
+        source_info = ""
+        if gt_count or prop_count:
+            source_info = f" (GT={gt_count}, propagated={prop_count})"
+        color_name = {(255, 128, 0): "blue", (0, 255, 255): "yellow",
+                      (0, 0, 255): "red", (0, 255, 0): "green"}.get(
+            CATEGORY_COLORS.get(cat, DEFAULT_COLOR), "?"
         )
-        print(f"    {prompt} ({color_name}): {total_masks} masks across "
-              f"{frames_with}/{len(all_results)} frames")
+        print(f"    {cat} ({color_name}): {total_masks} masks across "
+              f"{frames_with}/{len(all_results)} frames{source_info}")
 
     return all_results
 
@@ -582,7 +849,7 @@ def process_snippet_video(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate tool/cloth masks using SAM3 video mode"
+        description="Generate tool masks using SAM3 video mode"
     )
 
     parser.add_argument(
@@ -598,8 +865,8 @@ def parse_args():
         help="Specific snippet number (default: all snippets)",
     )
     parser.add_argument(
-        "--prompts", nargs="+", default=["tool", "cloth"],
-        help="Text prompts for detection (default: tool cloth)",
+        "--prompts", nargs="+", default=["tool"],
+        help="Text prompts for detection (default: tool)",
     )
     parser.add_argument(
         "--tissue-seg-dir", default=None,
