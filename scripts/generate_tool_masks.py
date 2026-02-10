@@ -515,7 +515,11 @@ def _load_episode_annotations(tissue_seg_dir: Path, episode: str):
     if not ep_dir.exists():
         return None
 
-    json_files = sorted(ep_dir.glob("*.json"))
+    # Only load COCO-format annotation files (train/test/fill), not snippet metadata
+    json_files = sorted(
+        f for f in ep_dir.glob("*.json")
+        if f.stem in ("train", "test") or f.stem.startswith("fill_")
+    )
     if not json_files:
         return None
 

@@ -110,7 +110,7 @@ def load_video_model(lora_checkpoint=None):
     print(f"Model device: {device}")
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(device)
-        mem_gb = props.total_mem / (1024 ** 3)
+        mem_gb = getattr(props, "total_memory", getattr(props, "total_mem", 0)) / (1024 ** 3)
         print(f"GPU: {props.name} ({mem_gb:.1f} GB)")
 
     return predictor
@@ -328,7 +328,9 @@ def propagate_tissue_masks(
     # Start SAM3 video session
     session = predictor.start_session(resource_path=str(frames_dir))
     sid = session["session_id"]
-    inference_state = session.get("inference_state")
+    # Access internal inference state for mask API (tracker.add_new_mask)
+    session_data = predictor._get_session(sid)
+    inference_state = session_data["state"]
 
     # Add mask prompts at every GT frame
     prompts_added = 0
@@ -338,9 +340,6 @@ def propagate_tissue_masks(
         gt_masks = annotation_loader.get_frame_masks_by_frame_num(frame_num)
         if gt_masks is None:
             continue
-
-        h = all_results[fidx]["height"]
-        w = all_results[fidx]["width"]
 
         for gt_cat, obj_id in tissue_cats.items():
             if gt_cat not in gt_masks:
@@ -352,20 +351,12 @@ def propagate_tissue_masks(
             mask_tensor = torch.from_numpy(mask_np).float()
 
             try:
-                if inference_state is not None:
-                    predictor.tracker.add_new_mask(
-                        inference_state=inference_state,
-                        frame_idx=fidx,
-                        obj_id=obj_id,
-                        mask=mask_tensor,
-                    )
-                else:
-                    predictor.add_new_mask(
-                        session_id=sid,
-                        frame_idx=fidx,
-                        obj_id=obj_id,
-                        mask=mask_tensor,
-                    )
+                predictor.model.tracker.add_new_mask(
+                    inference_state=inference_state,
+                    frame_idx=fidx,
+                    obj_id=obj_id,
+                    mask=mask_tensor,
+                )
                 prompts_added += 1
             except Exception as e:
                 print(f"    WARNING: Failed to add tissue mask at frame {fidx}: {e}")
