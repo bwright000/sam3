@@ -71,6 +71,8 @@ class COCOAnnotationLoader:
         print(f"  Annotations: {sum(len(v) for v in self.annotations.values())}")
         print(f"  Categories: {self.categories}")
 
+        self.build_frame_mapping()
+
     def polygon_to_mask(self, segmentation: list, height: int, width: int) -> np.ndarray:
         """Convert COCO polygon segmentation to binary mask."""
         mask = np.zeros((height, width), dtype=np.uint8)
@@ -116,6 +118,34 @@ class COCOAnnotationLoader:
                 key=lambda iid: self.images[iid]["file_name"]
             )
         return dict(splits)
+
+    def build_frame_mapping(self):
+        """Build video_frame_number -> image_id mapping from split filenames.
+
+        Annotation splits encode video position: split_N/XXXXX.jpg = frame N*120+XXXXX.
+        image_ids are sequential and DON'T match frame numbers when splits are missing.
+        """
+        self.frame_to_image_id = {}
+        for img_id, img_info in self.images.items():
+            fname = img_info["file_name"]
+            m = re.search(r'split_(\d+)', fname)
+            if not m:
+                continue
+            split_num = int(m.group(1))
+            offset = int(Path(fname).stem)
+            video_frame = split_num * 120 + offset
+            self.frame_to_image_id[video_frame] = img_id
+        if self.frame_to_image_id:
+            frames = sorted(self.frame_to_image_id.keys())
+            print(f"  Frame mapping: {len(self.frame_to_image_id)} video frames "
+                  f"(range {frames[0]}-{frames[-1]})")
+
+    def get_frame_masks_by_frame_num(self, frame_num: int) -> Optional[Dict[str, np.ndarray]]:
+        """Get masks using video frame number (not COCO image_id)."""
+        image_id = self.frame_to_image_id.get(frame_num)
+        if image_id is None:
+            return None
+        return self.get_frame_masks(image_id)
 
     def resolve_frame_path(self, image_id: int) -> Optional[Path]:
         """Resolve the actual file path for a frame."""

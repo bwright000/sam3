@@ -527,6 +527,9 @@ def _load_episode_annotations(tissue_seg_dir: Path, episode: str):
     for jf in json_files[1:]:
         _merge_annotations_into(loader, jf)
 
+    # Rebuild frame mapping after all merges (covers all images from all JSON files)
+    loader.build_frame_mapping()
+
     print(f"  GT annotations for {episode}: {len(loader.images)} frames total")
     return loader
 
@@ -708,11 +711,15 @@ def _retry_dropped_frames(
     return retried
 
 
-def _subtract_gt_tissue(all_results, frame_files, annotation_loader, prompts):
+def _subtract_gt_tissue(all_results, frame_files, annotation_loader, prompts, erode_px=3):
     """
     Subtract GT liver/gallbladder masks from SAM3 tool masks.
     Removes tool mask pixels that overlap with known tissue regions.
     GT tissue takes priority — any tool pixels on liver/gallbladder are removed.
+
+    An optional erosion buffer (erode_px) shrinks the tissue mask slightly
+    before subtraction to avoid over-aggressive removal at tool-tissue
+    boundaries where GT polygons may be slightly over-sized.
 
     Returns count of frames where tool masks were modified.
     """
@@ -721,11 +728,10 @@ def _subtract_gt_tissue(all_results, frame_files, annotation_loader, prompts):
         # Extract frame number from filename: frame_001582.webp -> 1582
         frame_num = int(fpath.stem.split("_")[1])
 
-        # Check if GT exists for this frame
-        if frame_num not in annotation_loader.images:
+        # Look up GT by video frame number (not raw image_id)
+        gt_masks = annotation_loader.get_frame_masks_by_frame_num(frame_num)
+        if gt_masks is None:
             continue
-
-        gt_masks = annotation_loader.get_frame_masks(frame_num)
         h, w = result["height"], result["width"]
 
         # Combined tissue mask (Liver + Gallbladder)
@@ -735,6 +741,13 @@ def _subtract_gt_tissue(all_results, frame_files, annotation_loader, prompts):
                 tissue |= gt_masks[cat]
         if tissue.sum() == 0:
             continue
+
+        # Erode tissue mask to avoid over-aggressive boundary subtraction
+        if erode_px > 0:
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (erode_px * 2 + 1, erode_px * 2 + 1)
+            )
+            tissue = cv2.erode(tissue, kernel, iterations=1)
 
         # Subtract tissue from each tool mask
         modified = False
@@ -755,6 +768,19 @@ def _subtract_gt_tissue(all_results, frame_files, annotation_loader, prompts):
                     old_area = md["area"]
                     md["area"] = new_area
                     md["segmentation"] = mask_to_coco_polygons(cleaned_mask * 255)
+
+                    # Recompute bbox from cleaned mask
+                    ys, xs = np.where(cleaned_mask > 0)
+                    md["bbox"] = [float(xs.min()), float(ys.min()),
+                                  float(xs.max() - xs.min()), float(ys.max() - ys.min())]
+
+                    # Log area loss percentage
+                    loss_pct = 100 * (old_area - new_area) / old_area if old_area > 0 else 0
+                    md["gt_subtraction_loss_pct"] = round(loss_pct, 1)
+                    if loss_pct > 50:
+                        print(f"  WARNING: {fpath.stem} {prompt} tool lost "
+                              f"{loss_pct:.0f}% area to GT subtraction")
+
                     new_masks.append(md)
                     if new_area != old_area:
                         modified = True
@@ -783,8 +809,9 @@ def _render_overlay_from_results(frame_path, frame_result, prompts, annotation_l
     # --- Layer 1: GT tissue masks (bottom layer) ---
     if annotation_loader is not None:
         frame_num = int(frame_path.stem.split("_")[1])
-        if frame_num in annotation_loader.images:
-            gt_masks = annotation_loader.get_frame_masks(frame_num)
+        gt_masks_result = annotation_loader.get_frame_masks_by_frame_num(frame_num)
+        if gt_masks_result is not None:
+            gt_masks = gt_masks_result
             for gt_cat, color_key in GT_CAT_MAP.items():
                 if gt_cat not in gt_masks:
                     continue
@@ -848,6 +875,7 @@ def process_snippet(
     min_area: int = 5000,
     expected_tools: int = 2,
     annotation_loader=None,
+    gt_erode_px: int = 3,
 ):
     """
     Process a single snippet folder with SAM3 text prompts.
@@ -946,7 +974,8 @@ def process_snippet(
     gt_cleaned = 0
     if annotation_loader is not None:
         gt_cleaned = _subtract_gt_tissue(
-            all_results, frame_files, annotation_loader, prompts
+            all_results, frame_files, annotation_loader, prompts,
+            erode_px=gt_erode_px,
         )
         if gt_cleaned > 0:
             print(f"\n  Pass 3: GT subtraction cleaned {gt_cleaned} frames")
@@ -965,7 +994,7 @@ def process_snippet(
         json.dump(all_results, f, indent=2)
 
     # Stitch overlays into video
-    _stitch_snippet_video(overlay_dir, output_dir / f"{snippet_name}_overlay.mp4", fps=6)
+    _stitch_snippet_video(overlay_dir, output_dir / f"{snippet_name}_overlay.mp4", fps=60)
 
     # Summary
     total_elapsed = time.time() - start_time
@@ -999,7 +1028,7 @@ def _draw_legend(frame, prompts, masks_dict):
         y += 30
 
 
-def _stitch_snippet_video(frames_dir: Path, output_path: Path, fps: int = 6):
+def _stitch_snippet_video(frames_dir: Path, output_path: Path, fps: int = 60):
     """Stitch overlay JPGs into a video."""
     frame_files = sorted(frames_dir.glob("frame_*.jpg"))
     if not frame_files:
@@ -1052,8 +1081,8 @@ def main():
     snippet_group.add_argument(
         "--prompts",
         nargs="+",
-        default=["liver", "gallbladder", "tool"],
-        help="Text prompts for SAM3 (default: liver gallbladder tool)",
+        default=["tool", "cloth"],
+        help="Text prompts for SAM3 (default: tool cloth)",
     )
 
     # --- Box-prompt mode args ---
@@ -1133,6 +1162,11 @@ def main():
         default=None,
         help="Path to tissue_segmentation directory with per-episode GT annotations "
              "(e.g., 'F:/2026 vibes/MPHY Project/annotated_dataset/tissue_segmentation')",
+    )
+    parser.add_argument(
+        "--gt-erode-px", type=int, default=3,
+        help="Erosion buffer (pixels) applied to GT tissue mask before subtraction "
+             "(avoids over-aggressive removal at boundaries; default: 3, 0=disable)",
     )
 
     args = parser.parse_args()
@@ -1237,6 +1271,7 @@ def _main_snippets(args):
             min_area=args.min_area,
             expected_tools=args.expected_tools,
             annotation_loader=ann_loaders.get(ep_name),
+            gt_erode_px=args.gt_erode_px,
         )
 
     print(f"\n{'=' * 60}")

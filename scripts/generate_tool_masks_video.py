@@ -1,8 +1,15 @@
 """
 Generate tool/cloth segmentation masks using SAM3 Video Mode.
 
-Uses SAM3's video predictor API with temporal memory tracking:
-  1. Text prompt ("surgical tool and cloth") on keyframe → initial masklets
+Runs separate video sessions per prompt (default: "tool" and "cloth") so each
+category gets its own tracked masklets and distinct overlay color:
+  - tool  → blue
+  - cloth → yellow
+  - liver (GT) → red
+  - gallbladder (GT) → green
+
+Pipeline per prompt:
+  1. Text prompt on keyframe → initial masklets
   2. Video propagation tracks masklets through all frames
   3. GT tissue subtraction (liver/gallbladder) removes overlap
   4. Combined overlay rendering + video stitching
@@ -11,13 +18,13 @@ This script is GPU-optimized (A100 recommended). The existing image-mode
 pipeline (generate_tool_masks.py) is unchanged and still usable.
 
 Usage:
-    # Process a single snippet
+    # Process a single snippet (default prompts: tool cloth)
     python scripts/generate_tool_masks_video.py \\
         --segments-dir data/Segments --episode C_1 --snippet 1
 
-    # Process all snippets for an episode
+    # Custom prompts
     python scripts/generate_tool_masks_video.py \\
-        --segments-dir data/Segments --episode C_1
+        --segments-dir data/Segments --episode C_1 --prompts tool cloth gauze
 
     # With GT tissue subtraction
     python scripts/generate_tool_masks_video.py \\
@@ -38,6 +45,7 @@ import argparse
 import json
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import cv2
@@ -61,6 +69,9 @@ from scripts.generate_tool_masks import (
 
 # SAM3 video predictor
 from sam3.model.sam3_video_predictor import Sam3VideoPredictor
+
+# Extend color palette: "tool" already blue, add "cloth" as yellow
+CATEGORY_COLORS["cloth"] = (0, 255, 255)  # Yellow (BGR)
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +215,178 @@ def _convert_video_output(outputs, frame_path, prompt, min_area):
 
 
 # ---------------------------------------------------------------------------
+# Keyframe selection and session helpers
+# ---------------------------------------------------------------------------
+
+def _select_keyframes(effective_frames, num_keyframes):
+    """Select evenly-spaced keyframe indices across the video."""
+    if num_keyframes <= 1:
+        return [0]
+    step = effective_frames / num_keyframes
+    return [int(i * step) for i in range(num_keyframes)]
+
+
+def _run_prompt_session(
+    predictor, frames_dir, frame_files, effective_frames,
+    prompt, keyframe_idx, direction, min_area, test_frames,
+):
+    """
+    Run one video session: text prompt on keyframe_idx, propagate, collect results.
+
+    Returns:
+        results: dict {frame_idx: result_dict} with per-frame mask data
+        confidences: dict {frame_idx: float} with avg confidence per frame
+    """
+    session = predictor.start_session(resource_path=str(frames_dir))
+    sid = session["session_id"]
+
+    predictor.add_prompt(session_id=sid, frame_idx=keyframe_idx, text=prompt)
+
+    results = {}
+    confidences = {}
+    pass_label = ""
+    frames_seen = 0
+
+    t0 = time.time()
+    for response in predictor.propagate_in_video(
+        session_id=sid,
+        propagation_direction=direction,
+        start_frame_idx=None,
+        max_frame_num_to_track=test_frames,
+    ):
+        frame_idx = response["frame_index"]
+        outputs = response["outputs"]
+
+        if frame_idx >= effective_frames:
+            continue
+
+        result = _convert_video_output(
+            outputs, frame_files[frame_idx], prompt, min_area
+        )
+        results[frame_idx] = result
+
+        # Compute avg confidence from out_probs
+        probs = outputs.get("out_probs")
+        if probs is not None and len(probs) > 0:
+            avg_conf = float(probs.mean())
+        else:
+            avg_conf = 0.0
+        confidences[frame_idx] = avg_conf
+
+        frames_seen += 1
+        # Detect which pass we're on (forward: ascending, backward: descending)
+        if frames_seen == 1:
+            pass_label = "fwd"
+        elif frame_idx < keyframe_idx or (frames_seen > effective_frames):
+            pass_label = "bwd"
+
+        n_masks = len(result["masks"].get(prompt, []))
+        elapsed = time.time() - t0
+        print(f"    [{pass_label}] frame {frame_idx:4d} | "
+              f"{prompt}={n_masks} conf={avg_conf:.2f} | "
+              f"{elapsed:.1f}s")
+
+    predictor.close_session(session_id=sid)
+    elapsed = time.time() - t0
+    print(f"  Session done (keyframe={keyframe_idx}, {len(results)} frames, {elapsed:.1f}s)")
+    return results, confidences
+
+
+def _detect_and_recover_dropouts(
+    predictor, frames_dir, frame_files, effective_frames,
+    prompt, all_results, confidences, direction, min_area, test_frames,
+    conf_threshold, dropout_window,
+):
+    """
+    Scan for confidence dropouts and re-prompt to recover lost tracking.
+
+    Finds stretches of dropout_window+ consecutive frames where avg confidence
+    < conf_threshold, then re-prompts on the first frame after the dropout.
+
+    Returns number of recovered dropout windows.
+    """
+    if conf_threshold <= 0 or not confidences:
+        return 0
+
+    # Build sorted frame confidence list
+    sorted_frames = sorted(confidences.keys())
+    if not sorted_frames:
+        return 0
+
+    # Detect dropout windows
+    dropout_regions = []
+    current_dropout_start = None
+    consecutive_low = 0
+
+    for fidx in sorted_frames:
+        conf = confidences.get(fidx, 0.0)
+        if conf < conf_threshold:
+            if current_dropout_start is None:
+                current_dropout_start = fidx
+            consecutive_low += 1
+        else:
+            if consecutive_low >= dropout_window:
+                dropout_regions.append((current_dropout_start, fidx - 1))
+            current_dropout_start = None
+            consecutive_low = 0
+
+    # Handle dropout at end of video
+    if consecutive_low >= dropout_window and current_dropout_start is not None:
+        dropout_regions.append((current_dropout_start, sorted_frames[-1]))
+
+    if not dropout_regions:
+        return 0
+
+    print(f"\n  Detected {len(dropout_regions)} dropout region(s) for '{prompt}':")
+    recovered = 0
+
+    for start_frame, end_frame in dropout_regions:
+        # Find recovery frame: first frame AFTER dropout with masks
+        recovery_frame = None
+        for fidx in range(end_frame + 1, effective_frames):
+            if confidences.get(fidx, 0) >= conf_threshold:
+                recovery_frame = fidx
+                break
+
+        # Fallback: use midpoint of dropout as recovery frame
+        if recovery_frame is None:
+            recovery_frame = (start_frame + end_frame) // 2
+
+        print(f"    Dropout frames {start_frame}-{end_frame} "
+              f"(conf<{conf_threshold}), re-prompting at frame {recovery_frame}")
+
+        # Run recovery session
+        rec_results, rec_confidences = _run_prompt_session(
+            predictor, frames_dir, frame_files, effective_frames,
+            prompt, recovery_frame, direction, min_area, test_frames,
+        )
+
+        # Merge recovered results only for frames in/near the dropout region
+        merge_start = max(0, start_frame - dropout_window)
+        merge_end = min(effective_frames, end_frame + dropout_window + 1)
+        merged = 0
+        for fidx in range(merge_start, merge_end):
+            rec_result = rec_results.get(fidx)
+            if rec_result is None:
+                continue
+            rec_conf = rec_confidences.get(fidx, 0)
+            old_conf = confidences.get(fidx, 0)
+            # Keep recovery result if it has better confidence
+            if rec_conf > old_conf:
+                all_results[fidx]["masks"][prompt] = rec_result["masks"].get(prompt, [])
+                if rec_result["height"]:
+                    all_results[fidx]["height"] = rec_result["height"]
+                    all_results[fidx]["width"] = rec_result["width"]
+                confidences[fidx] = rec_conf
+                merged += 1
+
+        print(f"    Recovered {merged} frames from dropout")
+        recovered += 1
+
+    return recovered
+
+
+# ---------------------------------------------------------------------------
 # Per-snippet video processing
 # ---------------------------------------------------------------------------
 
@@ -212,23 +395,34 @@ def process_snippet_video(
     snippet_dir,
     episode,
     snippet_id,
-    prompt,
+    prompts,
     output_dir,
     annotation_loader=None,
     min_area=5000,
     test_frames=None,
+    num_keyframes=1,
+    forward_only=False,
+    confidence_threshold=0.3,
+    dropout_window=5,
+    gt_erode_px=3,
 ):
     """
-    Process a snippet using SAM3 video mode.
+    Process a snippet using SAM3 video mode with separate prompts.
 
-    Two-stage approach:
-      Stage 1: Text prompt on keyframe → masklets for tools/cloth only
-      Stage 2: Video propagation → track masklets through all frames
+    Runs a separate video session per prompt (e.g. "tool", "cloth") so each
+    category gets its own tracked masklets and distinct overlay color.
+
+    Supports multi-keyframe prompting, bidirectional propagation, and
+    confidence-triggered re-prompting for tracking dropout recovery.
 
     Then: GT tissue subtraction + overlay rendering + video stitching.
     """
     frames_dir = snippet_dir / "frames_left"
-    frame_files = sorted(frames_dir.glob("*.webp"))
+    frame_files = sorted(frames_dir.glob("frame_*.webp"))
+    if not frame_files:
+        frame_files = sorted(frames_dir.glob("frame_*.png"))
+    if not frame_files:
+        frame_files = sorted(frames_dir.glob("frame_*.jpg"))
     if not frame_files:
         print(f"  WARNING: No frames found in {frames_dir}")
         return []
@@ -239,8 +433,15 @@ def process_snippet_video(
     else:
         effective_frames = total_frames
 
+    direction = "forward" if forward_only else "both"
+    keyframes = _select_keyframes(effective_frames, num_keyframes)
+
     print(f"\n  Processing {snippet_id}: {effective_frames} frames"
-          f" (of {total_frames}), prompt='{prompt}'")
+          f" (of {total_frames}), prompts={prompts}")
+    print(f"  Direction: {direction}, keyframes: {keyframes}")
+    if confidence_threshold > 0:
+        print(f"  Confidence recovery: threshold={confidence_threshold}, "
+              f"window={dropout_window}")
 
     # Create output directories
     overlays_dir = output_dir / "overlays"
@@ -248,62 +449,87 @@ def process_snippet_video(
 
     t0 = time.time()
 
-    # --- Stage 1: Start session + text prompt → masklets ---
-    print(f"  Starting video session ({total_frames} frames)...")
-    session = predictor.start_session(resource_path=str(frames_dir))
-    sid = session["session_id"]
-
-    # Add text prompt on first frame — applies globally to all frames
-    # This constrains detection to only find tools/cloth
-    predictor.add_prompt(session_id=sid, frame_idx=0, text=prompt)
-    print(f"  Text prompt applied: '{prompt}'")
-
-    # --- Stage 2: Propagate masklets through video ---
-    print(f"  Propagating...")
+    # Pre-initialise per-frame results with empty masks and confidence tracking
     all_results = []
-    frame_times = []
+    for fpath in frame_files[:effective_frames]:
+        all_results.append({
+            "frame": fpath.stem,
+            "height": 0,
+            "width": 0,
+            "masks": {p: [] for p in prompts},
+            "avg_confidence": {p: 0.0 for p in prompts},
+        })
 
-    for frame_idx, outputs in predictor.propagate_in_video(
-        session_id=sid,
-        propagation_direction="forward",
-        start_frame_idx=None,
-        max_frame_num_to_track=test_frames,
-    ):
-        ft0 = time.time()
+    # --- Run a separate video session per prompt ---
+    for prompt in prompts:
+        print(f"\n  --- Prompt: '{prompt}' ---")
 
-        # Map frame_idx to our frame file
-        if frame_idx >= len(frame_files):
-            break
+        # --- Multi-keyframe: run one session per keyframe, collect all results ---
+        all_kf_results = {}  # keyframe_idx -> {frame_idx: result}
+        all_kf_confidences = {}  # keyframe_idx -> {frame_idx: float}
 
-        result = _convert_video_output(
-            outputs, frame_files[frame_idx], prompt, min_area
-        )
-        all_results.append(result)
+        for kf_idx in keyframes:
+            print(f"\n  Keyframe {kf_idx} (of {keyframes}):")
+            kf_results, kf_confidences = _run_prompt_session(
+                predictor, frames_dir, frame_files, effective_frames,
+                prompt, kf_idx, direction, min_area, test_frames,
+            )
+            all_kf_results[kf_idx] = kf_results
+            all_kf_confidences[kf_idx] = kf_confidences
 
-        n_masks = len(result["masks"].get(prompt, []))
-        ft = time.time() - ft0
-        frame_times.append(ft)
+        # --- Merge keyframe results: keep highest-confidence per frame ---
+        merged_confidences = {}  # frame_idx -> best avg confidence
+        for fidx in range(effective_frames):
+            best_conf = -1.0
+            best_kf = keyframes[0]
+            for kf_idx in keyframes:
+                conf = all_kf_confidences.get(kf_idx, {}).get(fidx, 0.0)
+                if conf > best_conf:
+                    best_conf = conf
+                    best_kf = kf_idx
 
-        # Compact progress logging
-        if (frame_idx + 1) % 10 == 0 or frame_idx == 0:
-            elapsed = time.time() - t0
-            print(f"    [{frame_idx+1}/{effective_frames}] "
-                  f"{frame_files[frame_idx].stem} | masks={n_masks} | "
-                  f"{elapsed:.0f}s elapsed")
+            best_result = all_kf_results.get(best_kf, {}).get(fidx)
+            if best_result is not None:
+                all_results[fidx]["masks"][prompt] = best_result["masks"].get(prompt, [])
+                if best_result["height"]:
+                    all_results[fidx]["height"] = best_result["height"]
+                    all_results[fidx]["width"] = best_result["width"]
+            all_results[fidx]["avg_confidence"][prompt] = max(best_conf, 0.0)
+            merged_confidences[fidx] = max(best_conf, 0.0)
 
-    predictor.close_session(session_id=sid)
+        if len(keyframes) > 1:
+            avg_merged = np.mean(list(merged_confidences.values())) if merged_confidences else 0
+            print(f"\n  Merged {len(keyframes)} keyframe passes "
+                  f"(avg confidence: {avg_merged:.3f})")
+
+        # --- Confidence-triggered re-prompting for dropout recovery ---
+        if confidence_threshold > 0:
+            recovered = _detect_and_recover_dropouts(
+                predictor, frames_dir, frame_files, effective_frames,
+                prompt, all_results, merged_confidences, direction,
+                min_area, test_frames, confidence_threshold, dropout_window,
+            )
+            if recovered > 0:
+                # Update avg_confidence in results from merged_confidences
+                for fidx in range(effective_frames):
+                    all_results[fidx]["avg_confidence"][prompt] = merged_confidences.get(fidx, 0.0)
+
+        prompt_time = time.time() - t0
+        print(f"\n  '{prompt}' done ({prompt_time:.1f}s)")
+
     inference_time = time.time() - t0
-    print(f"  Video inference done: {len(all_results)} frames in {inference_time:.1f}s "
-          f"({inference_time/max(len(all_results),1):.1f}s/frame)")
+    print(f"\n  Video inference done: {len(all_results)} frames, "
+          f"{len(prompts)} prompts in {inference_time:.1f}s")
 
     # Collect frame files for the frames we actually processed
     processed_frame_files = frame_files[:len(all_results)]
 
-    # --- Pass 3: GT tissue subtraction ---
+    # --- GT tissue subtraction ---
     if annotation_loader:
         print(f"\n  GT tissue subtraction...")
         cleaned = _subtract_gt_tissue(
-            all_results, processed_frame_files, annotation_loader, [prompt]
+            all_results, processed_frame_files, annotation_loader, prompts,
+            erode_px=gt_erode_px,
         )
         print(f"  GT subtraction cleaned {cleaned} frames")
 
@@ -311,14 +537,14 @@ def process_snippet_video(
     print(f"  Rendering overlays...")
     for i, (result, fpath) in enumerate(zip(all_results, processed_frame_files)):
         _, overlay, _ = _render_overlay_from_results(
-            fpath, result, [prompt], annotation_loader
+            fpath, result, prompts, annotation_loader
         )
         out_path = overlays_dir / f"{fpath.stem}.jpg"
         cv2.imwrite(str(out_path), overlay)
 
     # --- Stitch video ---
     video_path = output_dir / f"{snippet_id}_overlay.mp4"
-    _stitch_snippet_video(overlays_dir, video_path, fps=6)
+    _stitch_snippet_video(overlays_dir, video_path, fps=60)
 
     # --- Save results JSON ---
     results_path = output_dir / f"{snippet_id}_results.json"
@@ -326,7 +552,7 @@ def process_snippet_video(
         json.dump({
             "episode": episode,
             "snippet_id": snippet_id,
-            "prompt": prompt,
+            "prompts": prompts,
             "mode": "video",
             "num_frames": len(all_results),
             "inference_time_s": round(inference_time, 1),
@@ -335,17 +561,17 @@ def process_snippet_video(
     print(f"  Results saved: {results_path}")
 
     # --- Summary ---
-    total_masks = sum(
-        len(r["masks"].get(prompt, [])) for r in all_results
-    )
-    frames_with_masks = sum(
-        1 for r in all_results if len(r["masks"].get(prompt, [])) > 0
-    )
     total_time = time.time() - t0
     print(f"\n  {snippet_id} done: {len(all_results)} frames in {total_time:.1f}s "
           f"({total_time/max(len(all_results),1):.1f}s/frame)")
-    print(f"    {prompt}: {total_masks} masks across "
-          f"{frames_with_masks}/{len(all_results)} frames")
+    for prompt in prompts:
+        total_masks = sum(len(r["masks"].get(prompt, [])) for r in all_results)
+        frames_with = sum(1 for r in all_results if len(r["masks"].get(prompt, [])) > 0)
+        color_name = {(255, 128, 0): "blue", (0, 255, 255): "yellow"}.get(
+            CATEGORY_COLORS.get(prompt, DEFAULT_COLOR), "?"
+        )
+        print(f"    {prompt} ({color_name}): {total_masks} masks across "
+              f"{frames_with}/{len(all_results)} frames")
 
     return all_results
 
@@ -372,8 +598,8 @@ def parse_args():
         help="Specific snippet number (default: all snippets)",
     )
     parser.add_argument(
-        "--prompt", default="surgical tool and cloth",
-        help="Text prompt for detection (default: 'surgical tool and cloth')",
+        "--prompts", nargs="+", default=["tool", "cloth"],
+        help="Text prompts for detection (default: tool cloth)",
     )
     parser.add_argument(
         "--tissue-seg-dir", default=None,
@@ -394,6 +620,39 @@ def parse_args():
     parser.add_argument(
         "--output-dir", default="outputs/segments_video",
         help="Output directory (default: outputs/segments_video)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip snippets that already have results JSON (resume interrupted runs)",
+    )
+    parser.add_argument(
+        "--device", default=None, choices=["cpu", "cuda"],
+        help="Force device (default: auto-detect CUDA > CPU)",
+    )
+
+    # --- Propagation & recovery options ---
+    parser.add_argument(
+        "--forward-only",
+        action="store_true",
+        help="Forward-only propagation (default: bidirectional forward+backward)",
+    )
+    parser.add_argument(
+        "--num-keyframes", type=int, default=1,
+        help="Number of evenly-spaced keyframes to prompt (default: 1 = frame 0 only)",
+    )
+    parser.add_argument(
+        "--confidence-threshold", type=float, default=0.3,
+        help="Min avg confidence before triggering dropout recovery (default: 0.3, 0=disable)",
+    )
+    parser.add_argument(
+        "--dropout-window", type=int, default=5,
+        help="Consecutive low-confidence frames before re-prompting (default: 5)",
+    )
+    parser.add_argument(
+        "--gt-erode-px", type=int, default=3,
+        help="Erosion buffer (pixels) for GT tissue mask before subtraction "
+             "(default: 3, 0=disable)",
     )
 
     return parser.parse_args()
@@ -431,12 +690,17 @@ def main():
         print("ERROR: No snippets found")
         sys.exit(1)
 
-    # Count frames
+    # Count frames (check webp, then png, then jpg)
     total_frames = 0
     for snip_dir in snippet_list:
         frames_dir = snip_dir / "frames_left"
         if frames_dir.exists():
-            total_frames += len(list(frames_dir.glob("*.webp")))
+            n = len(list(frames_dir.glob("frame_*.webp")))
+            if not n:
+                n = len(list(frames_dir.glob("frame_*.png")))
+            if not n:
+                n = len(list(frames_dir.glob("frame_*.jpg")))
+            total_frames += n
 
     # --- Header ---
     print("=" * 60)
@@ -445,12 +709,25 @@ def main():
     print(f"Episode: {args.episode}")
     print(f"Snippets: {len(snippet_list)}")
     print(f"Total frames: {total_frames}")
-    print(f"Prompt: '{args.prompt}'")
+    print(f"Prompts: {args.prompts}")
     print(f"Output: {output_dir}")
     if args.test:
         print(f"Test mode: {args.test} frames per snippet")
+    if args.resume:
+        print(f"Resume: enabled (skipping completed snippets)")
+    if args.device:
+        print(f"Device: {args.device} (forced)")
     if args.lora_checkpoint:
         print(f"LoRA checkpoint: {args.lora_checkpoint}")
+    direction_label = "forward-only" if args.forward_only else "bidirectional"
+    print(f"Propagation: {direction_label}")
+    if args.num_keyframes > 1:
+        print(f"Keyframes: {args.num_keyframes}")
+    if args.confidence_threshold > 0:
+        print(f"Confidence recovery: threshold={args.confidence_threshold}, "
+              f"window={args.dropout_window}")
+    if args.gt_erode_px > 0:
+        print(f"GT erosion buffer: {args.gt_erode_px}px")
 
     # --- Load GT annotations ---
     ann_loader = None
@@ -466,25 +743,45 @@ def main():
     print()
     predictor = load_video_model(lora_checkpoint=args.lora_checkpoint)
 
+    # --- Force device if requested ---
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("WARNING: --device cuda requested but CUDA not available, using CPU")
+    elif args.device == "cpu" and torch.cuda.is_available():
+        print("Forcing CPU mode (--device cpu)")
+        predictor.model.cpu()
+
     # --- Process snippets ---
     t_total = time.time()
     for snip_dir in snippet_list:
         snippet_id = snip_dir.name
+
+        snip_output = output_dir / args.episode / snippet_id
+
+        # Resume: skip if results already exist
+        results_path = snip_output / f"{snippet_id}_results.json"
+        if args.resume and results_path.exists():
+            print(f"\n  Skipping {snippet_id} (results exist, --resume)")
+            continue
+
         print(f"\n{'=' * 60}")
         print(f"Episode: {args.episode} / {snippet_id}")
         print(f"{'=' * 60}")
 
-        snip_output = output_dir / args.episode / snippet_id
         process_snippet_video(
             predictor=predictor,
             snippet_dir=snip_dir,
             episode=args.episode,
             snippet_id=snippet_id,
-            prompt=args.prompt,
+            prompts=args.prompts,
             output_dir=snip_output,
             annotation_loader=ann_loader,
             min_area=args.min_area,
             test_frames=args.test,
+            num_keyframes=args.num_keyframes,
+            forward_only=args.forward_only,
+            confidence_threshold=args.confidence_threshold,
+            dropout_window=args.dropout_window,
+            gt_erode_px=args.gt_erode_px,
         )
 
     total_time = time.time() - t_total
