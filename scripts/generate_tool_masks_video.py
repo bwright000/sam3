@@ -69,6 +69,9 @@ from scripts.generate_tool_masks import (
 # SAM3 video predictor
 from sam3.model.sam3_video_predictor import Sam3VideoPredictor
 
+# For loading frames (supports .webp, .png, .jpg etc. via PIL)
+from sam3.model.io_utils import _load_img_as_tensor
+
 # Color palette: "tool" already blue from generate_tool_masks.py
 
 # Tissue categories for GT and propagation
@@ -285,6 +288,39 @@ def _add_gt_tissue_to_results(all_results, frame_files, annotation_loader):
     return gt_frame_indices
 
 
+def _load_frames_for_tracker(frame_files, num_frames, image_size):
+    """
+    Load video frames from the script's frame_files list for the tracker.
+
+    Uses the same file list as the rest of the pipeline to guarantee that
+    frame index N in the tracker corresponds to frame_files[N]. Supports
+    all image formats (.webp, .png, .jpg, etc.) via PIL.
+
+    Normalizes with mean=0.5, std=0.5 to match the tracker backbone's
+    expected normalization (sam2_utils.py defaults).
+
+    Returns (images_tensor, video_height, video_width).
+    """
+    images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float16)
+    video_height = video_width = None
+    for n, fpath in enumerate(frame_files[:num_frames]):
+        images[n], video_height, video_width = _load_img_as_tensor(
+            str(fpath), image_size
+        )
+    # Move to GPU if available
+    if torch.cuda.is_available():
+        images = images.cuda()
+    # Normalize (mean=0.5, std=0.5 — matching tracker backbone expectations)
+    img_mean = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float16)[:, None, None]
+    img_std = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float16)[:, None, None]
+    if torch.cuda.is_available():
+        img_mean = img_mean.cuda()
+        img_std = img_std.cuda()
+    images -= img_mean
+    images /= img_std
+    return images, video_height, video_width
+
+
 def propagate_tissue_masks(
     predictor,
     frames_dir,
@@ -296,10 +332,18 @@ def propagate_tissue_masks(
     min_area=500,
 ):
     """
-    Use SAM3 video propagation to fill tissue masks for frames without GT.
+    Use SAM3 tracker propagation to fill tissue masks for frames without GT.
 
-    Starts a SAM3 video session, adds mask prompts at all GT frames, then
-    propagates bidirectionally. Only collects output for non-GT frames.
+    Creates a standalone tracker state, loads frames from the script's own
+    frame_files list (guaranteeing index alignment), adds mask prompts at
+    all GT frames, then propagates bidirectionally.
+
+    Note: Uses the tracker (SAM2-style) directly rather than the full
+    Sam3VideoInference VG pipeline for two reasons:
+      1. The VG-level inference state does not expose the tracker's
+         obj_id_to_idx mapping needed by add_new_mask.
+      2. The tracker's built-in frame loader (sam2_utils.py) only supports
+         .jpg/.jpeg, but our frames may be .webp or .png.
 
     Args:
         predictor: Sam3VideoPredictor instance
@@ -325,12 +369,27 @@ def propagate_tissue_masks(
     # Category name -> SAM3 object ID mapping
     tissue_cats = {"Liver": 1, "Gallbladder": 2}
 
-    # Start SAM3 video session
-    session = predictor.start_session(resource_path=str(frames_dir))
-    sid = session["session_id"]
-    # Access internal inference state for mask API (tracker.add_new_mask)
-    session_data = predictor._get_session(sid)
-    inference_state = session_data["state"]
+    # Use the tracker directly with its own inference state.
+    # The VG-level inference state (from Sam3VideoInference.init_state) does not
+    # contain 'obj_id_to_idx'; only tracker-level states do.
+    tracker = predictor.model.tracker
+
+    # Load frames from the SAME frame_files list the script uses, so that
+    # frame_idx=N in the tracker is guaranteed to match frame_files[N].
+    # We bypass tracker.init_state(video_path=...) because its loader
+    # (sam2_utils.py) only supports .jpg/.jpeg — our frames may be .webp.
+    print(f"    Loading {effective_frames} frames for tracker...")
+    images, video_height, video_width = _load_frames_for_tracker(
+        frame_files, effective_frames, tracker.image_size,
+    )
+
+    # Create tracker state (no video_path — we inject images manually)
+    tracker_state = tracker.init_state(
+        video_height=video_height,
+        video_width=video_width,
+        num_frames=effective_frames,
+    )
+    tracker_state["images"] = images
 
     # Add mask prompts at every GT frame
     prompts_added = 0
@@ -351,8 +410,8 @@ def propagate_tissue_masks(
             mask_tensor = torch.from_numpy(mask_np).float()
 
             try:
-                predictor.model.tracker.add_new_mask(
-                    inference_state=inference_state,
+                tracker.add_new_mask(
+                    inference_state=tracker_state,
                     frame_idx=fidx,
                     obj_id=obj_id,
                     mask=mask_tensor,
@@ -363,7 +422,7 @@ def propagate_tissue_masks(
 
     if prompts_added == 0:
         print("    No tissue mask prompts added — skipping propagation")
-        predictor.close_session(session_id=sid)
+        del tracker_state, images
         return 0
 
     print(f"    Added {prompts_added} mask prompts across "
@@ -372,63 +431,64 @@ def propagate_tissue_masks(
     # Reverse lookup: obj_id -> lowercase category key
     obj_id_to_key = {1: "liver", 2: "gallbladder"}
 
-    # Propagate through all frames
+    # Consolidate mask inputs before propagation
+    tracker.propagate_in_video_preflight(tracker_state, run_mem_encoder=True)
+
+    # Propagate through all frames (forward then backward)
     filled = 0
     t0 = time.time()
 
-    for response in predictor.propagate_in_video(
-        session_id=sid,
-        propagation_direction="both",
-    ):
-        frame_idx = response["frame_index"]
-        if frame_idx >= effective_frames:
-            continue
-        # Only collect output for frames WITHOUT GT
-        if frame_idx not in need_propagation:
-            continue
-
-        outputs = response["outputs"]
-        obj_ids = outputs.get("out_obj_ids", [])
-        binary_masks = outputs.get("out_binary_masks", np.empty((0,)))
-
-        h = all_results[frame_idx]["height"]
-        w = all_results[frame_idx]["width"]
-
-        frame_filled = False
-        for i, oid in enumerate(obj_ids):
-            cat_key = obj_id_to_key.get(int(oid))
-            if cat_key is None:
+    for reverse in [False, True]:
+        for frame_idx, obj_ids, _low_res, video_res_masks, _scores in tracker.propagate_in_video(
+            tracker_state,
+            start_frame_idx=None,
+            max_frame_num_to_track=None,
+            reverse=reverse,
+        ):
+            if frame_idx >= effective_frames:
+                continue
+            # Only collect output for frames WITHOUT GT
+            if frame_idx not in need_propagation:
                 continue
 
-            mask_np = binary_masks[i]
-            if isinstance(mask_np, torch.Tensor):
-                mask_np = mask_np.cpu().numpy()
-            mask_uint8 = (mask_np > 0.5).astype(np.uint8)
-            area = float(mask_uint8.sum())
-            if area < min_area:
-                continue
+            frame_filled = False
+            for i, oid in enumerate(obj_ids):
+                cat_key = obj_id_to_key.get(int(oid))
+                if cat_key is None:
+                    continue
 
-            polygons = mask_to_coco_polygons(mask_uint8 * 255)
-            if not polygons:
-                continue
+                # video_res_masks shape: (num_objects, 1, H, W) — logits
+                mask_logits = video_res_masks[i]
+                if isinstance(mask_logits, torch.Tensor):
+                    mask_np = mask_logits.squeeze(0).cpu().numpy()
+                else:
+                    mask_np = mask_logits
+                mask_uint8 = (mask_np > 0.0).astype(np.uint8)
+                area = float(mask_uint8.sum())
+                if area < min_area:
+                    continue
 
-            ys, xs = np.where(mask_uint8 > 0)
-            bbox = [float(xs.min()), float(ys.min()),
-                    float(xs.max() - xs.min()), float(ys.max() - ys.min())]
+                polygons = mask_to_coco_polygons(mask_uint8 * 255)
+                if not polygons:
+                    continue
 
-            all_results[frame_idx]["masks"][cat_key] = [{
-                "segmentation": polygons,
-                "area": area,
-                "bbox": bbox,
-                "source": "sam3_propagated",
-            }]
-            frame_filled = True
+                ys, xs = np.where(mask_uint8 > 0)
+                bbox = [float(xs.min()), float(ys.min()),
+                        float(xs.max() - xs.min()), float(ys.max() - ys.min())]
 
-        if frame_filled:
-            filled += 1
+                all_results[frame_idx]["masks"][cat_key] = [{
+                    "segmentation": polygons,
+                    "area": area,
+                    "bbox": bbox,
+                    "source": "sam3_propagated",
+                }]
+                frame_filled = True
+
+            if frame_filled:
+                filled += 1
 
     elapsed = time.time() - t0
-    predictor.close_session(session_id=sid)
+    del tracker_state, images
     print(f"    Tissue propagation done: {filled}/{len(need_propagation)} "
           f"frames filled in {elapsed:.1f}s")
 

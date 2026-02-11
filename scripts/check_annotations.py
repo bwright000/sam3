@@ -122,13 +122,27 @@ class COCOAnnotationLoader:
     def build_frame_mapping(self):
         """Build video_frame_number -> image_id mapping from split filenames.
 
-        Annotation splits encode video position: split_N/XXXXX.jpg = frame N*120+XXXXX.
+        Annotation splits encode video position: split_N/XXXXX.jpg = frame N*split_size+XXXXX.
         image_ids are sequential and DON'T match frame numbers when splits are missing.
+
+        Split size is auto-detected from annotation filenames: max offset + 1.
+        E_3 uses 120-frame splits, F_3 uses 100-frame splits, C_1 uses 120.
 
         When multiple JSONs are merged (train+test), the same video frame may have
         different image_ids with different category annotations. We collect ALL
         image_ids per frame so get_frame_masks_by_frame_num returns complete masks.
         """
+        # Auto-detect split size from max filename offset
+        max_offset = 0
+        for img_info in self.images.values():
+            stem = Path(img_info["file_name"]).stem
+            try:
+                max_offset = max(max_offset, int(stem))
+            except ValueError:
+                pass
+        split_size = max_offset + 1 if max_offset > 0 else 120  # fallback
+        self._split_size = split_size
+
         self._frame_to_all_ids = defaultdict(list)
         for img_id, img_info in self.images.items():
             fname = img_info["file_name"]
@@ -141,12 +155,12 @@ class COCOAnnotationLoader:
                 offset = int(stem)
             except ValueError:
                 # C_1 train.json has broken file_name like "./split_14/" (no filename).
-                # For that dataset image_id = split*120+offset, so recover offset from id.
-                if img_id // 120 == split_num:
-                    offset = img_id % 120
+                # For that dataset image_id = split*split_size+offset, so recover offset from id.
+                if img_id // split_size == split_num:
+                    offset = img_id % split_size
                 else:
                     continue
-            video_frame = split_num * 120 + offset
+            video_frame = split_num * split_size + offset
             self._frame_to_all_ids[video_frame].append(img_id)
         # Backward-compat: single image_id mapping (first per frame)
         self.frame_to_image_id = {
@@ -155,7 +169,7 @@ class COCOAnnotationLoader:
         if self.frame_to_image_id:
             frames = sorted(self.frame_to_image_id.keys())
             print(f"  Frame mapping: {len(self.frame_to_image_id)} video frames "
-                  f"(range {frames[0]}-{frames[-1]})")
+                  f"(range {frames[0]}-{frames[-1]}, split_size={split_size})")
 
     def get_frame_masks_by_frame_num(self, frame_num: int) -> Optional[Dict[str, np.ndarray]]:
         """Get masks using video frame number (not COCO image_id).

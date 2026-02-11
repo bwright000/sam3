@@ -738,6 +738,17 @@ def _subtract_gt_tissue(all_results, frame_files, annotation_loader, prompts, er
             continue
         h, w = result["height"], result["width"]
 
+        # If frame has no tool masks, h/w may be 0 — recover from GT mask shape
+        if h == 0 or w == 0:
+            for cat in ["Liver", "Gallbladder"]:
+                if cat in gt_masks and gt_masks[cat].size > 0:
+                    h, w = gt_masks[cat].shape[:2]
+                    result["height"] = h
+                    result["width"] = w
+                    break
+            if h == 0 or w == 0:
+                continue
+
         # Combined tissue mask (Liver + Gallbladder)
         tissue = np.zeros((h, w), dtype=np.uint8)
         for cat in ["Liver", "Gallbladder"]:
