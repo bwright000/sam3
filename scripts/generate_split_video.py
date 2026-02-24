@@ -94,6 +94,27 @@ def find_gt_keyframes(frame_files, split_size):
 # Tissue segmentation: GT + tracker propagation
 # ---------------------------------------------------------------------------
 
+def _gt_proximity_distance(frame_idx, gt_keyframes, reverse):
+    """
+    Compute distance from a frame to its source GT keyframe.
+
+    For the forward pass: source is the nearest preceding GT (frame <= frame_idx).
+    For the backward pass: source is the nearest following GT (frame >= frame_idx).
+    Returns the absolute distance in frames.
+    """
+    if reverse:
+        # Backward pass originates from the nearest following GT
+        for local_idx, _ in gt_keyframes:
+            if local_idx >= frame_idx:
+                return abs(frame_idx - local_idx)
+    else:
+        # Forward pass originates from the nearest preceding GT
+        for local_idx, _ in reversed(gt_keyframes):
+            if local_idx <= frame_idx:
+                return abs(frame_idx - local_idx)
+    return 9999  # no GT found in the expected direction
+
+
 def process_tissue(
     tracker,
     frame_files,
@@ -108,7 +129,8 @@ def process_tissue(
     1. Creates a tracker state for the snippet
     2. Adds GT masks at each GT keyframe (frame 0 of each split)
     3. Propagates bidirectionally through all frames
-    4. Returns per-frame tissue results and area timeseries
+    4. Merges forward/backward passes by keeping the higher-confidence mask
+    5. Returns per-frame tissue results and forward-pass confidence scores
 
     Args:
         tracker: Sam3TrackingPredictor instance
@@ -120,7 +142,7 @@ def process_tissue(
 
     Returns:
         tissue_results: dict {frame_idx: {cat_key: mask_data_dict}}
-        areas: dict {cat_key: list of (frame_idx, area) tuples}
+        fwd_scores: dict {cat_key: list of (frame_idx, obj_score, mean_logit) tuples}
     """
     if not gt_keyframes:
         print("    No GT keyframes found — skipping tissue processing")
@@ -181,13 +203,17 @@ def process_tissue(
     # Consolidate and propagate
     tracker.propagate_in_video_preflight(tracker_state, run_mem_encoder=True)
 
-    tissue_results = {}  # frame_idx -> {cat_key: mask_data}
-    areas = {"liver": [], "gallbladder": []}
     gt_indices = set(idx for idx, _ in gt_keyframes if idx < effective_frames)
+
+    # Collect forward and backward results separately with confidence scores
+    fwd_results = {}  # frame_idx -> {cat_key: mask_data_dict (includes obj_score, mean_logit)}
+    bwd_results = {}
+    fwd_scores = {"liver": [], "gallbladder": []}  # for degradation monitoring
 
     t0 = time.time()
     for reverse in [False, True]:
-        for frame_idx, obj_ids, _low_res, video_res_masks, _scores in tracker.propagate_in_video(
+        target = bwd_results if reverse else fwd_results
+        for frame_idx, obj_ids, _low_res, video_res_masks, obj_scores in tracker.propagate_in_video(
             tracker_state,
             start_frame_idx=None,
             max_frame_num_to_track=None,
@@ -196,20 +222,32 @@ def process_tissue(
             if frame_idx >= effective_frames:
                 continue
 
-            if frame_idx not in tissue_results:
-                tissue_results[frame_idx] = {}
+            if frame_idx not in target:
+                target[frame_idx] = {}
 
             for i, oid in enumerate(obj_ids):
                 cat_key = OBJ_ID_TO_KEY.get(int(oid))
                 if cat_key is None:
                     continue
 
+                # Extract obj_score (model confidence for this object)
+                score_val = obj_scores[i]
+                if isinstance(score_val, torch.Tensor):
+                    obj_score = float(score_val.squeeze().cpu().item())
+                else:
+                    obj_score = float(score_val)
+
                 mask_logits = video_res_masks[i]
                 if isinstance(mask_logits, torch.Tensor):
                     mask_np = mask_logits.squeeze(0).cpu().numpy()
                 else:
                     mask_np = mask_logits
-                mask_uint8 = (mask_np > 0.0).astype(np.uint8)
+
+                # Compute mean logit over positive region (pixel-level confidence)
+                positive_mask = mask_np > 0.0
+                mean_logit = float(mask_np[positive_mask].mean()) if positive_mask.any() else 0.0
+
+                mask_uint8 = positive_mask.astype(np.uint8)
                 area = float(mask_uint8.sum())
 
                 if area < min_area:
@@ -224,18 +262,43 @@ def process_tissue(
                         float(xs.max() - xs.min()), float(ys.max() - ys.min())]
 
                 source = "ground_truth" if frame_idx in gt_indices else "sam3_propagated"
-                tissue_results[frame_idx][cat_key] = {
+                target[frame_idx][cat_key] = {
                     "segmentation": polygons,
                     "area": area,
                     "bbox": bbox,
                     "source": source,
+                    "obj_score": obj_score,
+                    "mean_logit": mean_logit,
                 }
 
-    # Build area timeseries (sorted by frame index)
-    for fidx in sorted(tissue_results.keys()):
+                # Collect forward-pass confidence for degradation monitoring
+                if not reverse:
+                    fwd_scores[cat_key].append((frame_idx, obj_score, mean_logit))
+
+    # Merge forward and backward: proximity-weighted obj_score with mean_logit tiebreaker.
+    # Closer to the source GT keyframe = less accumulated drift = more geometrically accurate.
+    tissue_results = {}
+    all_frame_idxs = set(fwd_results) | set(bwd_results)
+    for fidx in all_frame_idxs:
+        tissue_results[fidx] = {}
         for cat_key in ["liver", "gallbladder"]:
-            if cat_key in tissue_results[fidx]:
-                areas[cat_key].append((fidx, tissue_results[fidx][cat_key]["area"]))
+            fwd = fwd_results.get(fidx, {}).get(cat_key)
+            bwd = bwd_results.get(fidx, {}).get(cat_key)
+            if fwd and bwd:
+                d_fwd = _gt_proximity_distance(fidx, gt_keyframes, reverse=False)
+                d_bwd = _gt_proximity_distance(fidx, gt_keyframes, reverse=True)
+                fwd_score = fwd["obj_score"] * (1.0 / (1.0 + d_fwd))
+                bwd_score = bwd["obj_score"] * (1.0 / (1.0 + d_bwd))
+                if abs(fwd_score - bwd_score) < 1.0:
+                    # Scores are close — tiebreak with mean_logit (pixel confidence)
+                    pick = fwd if fwd.get("mean_logit", 0) >= bwd.get("mean_logit", 0) else bwd
+                else:
+                    pick = fwd if fwd_score >= bwd_score else bwd
+                tissue_results[fidx][cat_key] = pick
+            elif fwd:
+                tissue_results[fidx][cat_key] = fwd
+            elif bwd:
+                tissue_results[fidx][cat_key] = bwd
 
     elapsed = time.time() - t0
     filled = len(tissue_results)
@@ -243,41 +306,42 @@ def process_tissue(
           f"filled in {elapsed:.1f}s")
 
     del tracker_state, images
-    return tissue_results, areas
+    return tissue_results, fwd_scores
 
 
 # ---------------------------------------------------------------------------
-# Area degradation detection
+# Degradation detection (model confidence-based)
 # ---------------------------------------------------------------------------
 
-def detect_area_degradation(areas_list, window=60):
+def detect_degradation(scores_list, obj_score_threshold=0.0, mean_logit_threshold=1.0):
     """
-    Detect frames where tissue area drops anomalously.
+    Detect frames where tracker confidence drops, indicating degraded masks.
 
-    Uses exponential moving average (EMA) rolling statistics: if area drops
-    below rolling_mean - 2*rolling_std, mark as degraded.
+    Uses the model's own confidence signals (camera-pose-independent):
+    - obj_score: tracker's "is this object appearing?" logit. < 0 means lost.
+    - mean_logit: average pixel confidence over the mask. Low = fuzzy/uncertain.
 
     Args:
-        areas_list: list of (frame_idx, area) tuples, sorted by frame_idx
-        window: smoothing window size
+        scores_list: list of (frame_idx, obj_score, mean_logit) tuples,
+                     sorted by frame_idx (from forward pass)
+        obj_score_threshold: flag if obj_score below this (default: 0.0)
+        mean_logit_threshold: flag if mean_logit below this (default: 1.0)
 
     Returns:
         List of (start_frame_idx, end_frame_idx) degraded regions.
     """
-    if len(areas_list) < window:
+    if not scores_list:
         return []
 
-    degraded_frames = []
-    initial_area = np.mean([a for _, a in areas_list[:min(10, len(areas_list))]])
-    rolling_mean = initial_area
-    rolling_sq = initial_area ** 2
-    alpha = 2.0 / (window + 1)
+    scores_list = sorted(scores_list, key=lambda x: x[0])
 
-    for frame_idx, area in areas_list:
-        rolling_mean = alpha * area + (1 - alpha) * rolling_mean
-        rolling_sq = alpha * (area ** 2) + (1 - alpha) * rolling_sq
-        rolling_std = max((rolling_sq - rolling_mean ** 2) ** 0.5, 1.0)
-        if area < rolling_mean - 2 * rolling_std:
+    degraded_frames = []
+    for frame_idx, obj_score, mean_logit in scores_list:
+        # Model thinks object has disappeared
+        if obj_score < obj_score_threshold:
+            degraded_frames.append(frame_idx)
+        # Mask exists but model is very uncertain about it
+        elif mean_logit < mean_logit_threshold:
             degraded_frames.append(frame_idx)
 
     if not degraded_frames:
@@ -385,7 +449,7 @@ def backpropagate_tissue(
 
             # Propagate backward (reverse=True)
             recovered = 0
-            for frame_idx, obj_ids, _low, video_res_masks, _scores in tracker.propagate_in_video(
+            for frame_idx, obj_ids, _low, video_res_masks, obj_scores in tracker.propagate_in_video(
                 sub_state,
                 start_frame_idx=None,
                 max_frame_num_to_track=None,
@@ -398,12 +462,25 @@ def backpropagate_tissue(
                 for i, oid in enumerate(obj_ids):
                     if int(oid) != obj_id:
                         continue
+
+                    # Extract obj_score
+                    score_val = obj_scores[i]
+                    if isinstance(score_val, torch.Tensor):
+                        obj_score = float(score_val.squeeze().cpu().item())
+                    else:
+                        obj_score = float(score_val)
+
                     mask_logits = video_res_masks[i]
                     if isinstance(mask_logits, torch.Tensor):
                         mask_np_out = mask_logits.squeeze(0).cpu().numpy()
                     else:
                         mask_np_out = mask_logits
-                    mask_uint8 = (mask_np_out > 0.0).astype(np.uint8)
+
+                    # Compute mean logit confidence
+                    positive_mask = mask_np_out > 0.0
+                    mean_logit = float(mask_np_out[positive_mask].mean()) if positive_mask.any() else 0.0
+
+                    mask_uint8 = positive_mask.astype(np.uint8)
                     area = float(mask_uint8.sum())
                     if area < min_area:
                         continue
@@ -416,7 +493,6 @@ def backpropagate_tissue(
                     bbox = [float(xs.min()), float(ys.min()),
                             float(xs.max() - xs.min()), float(ys.max() - ys.min())]
 
-                    # Only overwrite if this frame was degraded
                     if actual_idx not in tissue_results:
                         tissue_results[actual_idx] = {}
                     tissue_results[actual_idx][cat_key] = {
@@ -424,6 +500,8 @@ def backpropagate_tissue(
                         "area": area,
                         "bbox": bbox,
                         "source": "sam3_backpropagated",
+                        "obj_score": obj_score,
+                        "mean_logit": mean_logit,
                     }
                     recovered += 1
 
@@ -531,16 +609,19 @@ def process_tools(
             print(f"      Prompt at frame {prompt_idx}: {n_tools} tools detected")
 
             if n_tools >= 1:
-                # Tools found! Propagate forward through this split
-                frames_to_track = split_end - prompt_idx
+                # Tools found! Propagate bidirectionally through this split.
+                # Using "both" keeps the tracker's memory bank from the forward pass
+                # when it runs backward, producing better backward masks.
+                # Tight bound: covers both directions without overshooting into adjacent splits.
+                max_track = max(prompt_idx - split_start, split_end - prompt_idx)
                 for response in predictor.propagate_in_video(
                     session_id=sid,
-                    propagation_direction="forward",
+                    propagation_direction="both",
                     start_frame_idx=prompt_idx,
-                    max_frame_num_to_track=frames_to_track,
+                    max_frame_num_to_track=max_track,
                 ):
                     fidx = response["frame_index"]
-                    if fidx >= effective_frames:
+                    if fidx < split_start or fidx >= split_end or fidx >= effective_frames:
                         continue
                     result = _convert_video_output(
                         response["outputs"],
@@ -551,34 +632,6 @@ def process_tools(
                     tool_masks = result["masks"].get("tool", [])
                     if tool_masks:
                         tool_results[fidx] = tool_masks
-
-                # Also propagate backward to cover frames before prompt_idx in this split
-                if prompt_idx > split_start:
-                    # Re-prompt at same frame (add_prompt resets state)
-                    predictor.add_prompt(
-                        session_id=sid, frame_idx=prompt_idx, text="tool"
-                    )
-                    frames_to_backtrack = prompt_idx - split_start + 1
-                    for response in predictor.propagate_in_video(
-                        session_id=sid,
-                        propagation_direction="backward",
-                        start_frame_idx=prompt_idx,
-                        max_frame_num_to_track=frames_to_backtrack,
-                    ):
-                        fidx = response["frame_index"]
-                        if fidx < split_start or fidx >= effective_frames:
-                            continue
-                        if fidx in tool_results:
-                            continue  # don't overwrite forward results
-                        result = _convert_video_output(
-                            response["outputs"],
-                            frame_files[fidx],
-                            "tool",
-                            min_area,
-                        )
-                        tool_masks = result["masks"].get("tool", [])
-                        if tool_masks:
-                            tool_results[fidx] = tool_masks
 
                 tools_found = True
                 frames_with = sum(1 for fidx in range(split_start, split_end) if fidx in tool_results)
@@ -712,7 +765,6 @@ def process_snippet(
     tissue_min_area=500,
     test_frames=None,
     reprompt_interval=20,
-    area_window=60,
     gt_erode_px=3,
 ):
     """
@@ -758,17 +810,17 @@ def process_snippet(
 
     # --- 2. Tissue: GT + tracker propagation ---
     tracker = predictor.model.tracker
-    tissue_results, areas = process_tissue(
+    tissue_results, fwd_scores = process_tissue(
         tracker, frame_files_eff, effective_frames,
         annotation_loader, gt_keyframes, min_area=tissue_min_area,
     )
 
-    # --- 3. Area monitoring + backpropagation ---
+    # --- 3. Confidence monitoring + backpropagation ---
     degraded_regions = {}
     for cat_key in ["liver", "gallbladder"]:
-        regions = detect_area_degradation(areas.get(cat_key, []), window=area_window)
+        regions = detect_degradation(fwd_scores.get(cat_key, []))
         if regions:
-            print(f"  Area degradation detected for {cat_key}: {len(regions)} region(s)")
+            print(f"  Tracking degradation detected for {cat_key}: {len(regions)} region(s)")
             for s, e in regions:
                 print(f"    [{s}-{e}]")
             degraded_regions[cat_key] = regions
@@ -789,27 +841,14 @@ def process_snippet(
     )
 
     # --- 5. Assemble per-frame results ---
+    # Read frame dimensions once (all frames in a snippet share the same resolution)
+    first_img = cv2.imread(str(frame_files_eff[0]))
+    snippet_h, snippet_w = first_img.shape[:2]
+    del first_img
+
     all_results = []
     for i in range(effective_frames):
         fpath = frame_files_eff[i]
-        # Get frame dimensions from the first available mask or read image
-        h, w = 0, 0
-        if i in tissue_results:
-            for cat_key, md in tissue_results[i].items():
-                # Get dimensions from polygons (estimate from bbox)
-                # Actually need image dimensions — read from first frame
-                pass
-        if i in tool_results:
-            for md in tool_results[i]:
-                if md.get("segmentation"):
-                    pass
-
-        # Read actual dimensions if not known yet
-        if h == 0 or w == 0:
-            img = cv2.imread(str(fpath))
-            if img is not None:
-                h, w = img.shape[:2]
-
         masks = {}
 
         # Tool masks
@@ -827,8 +866,8 @@ def process_snippet(
 
         all_results.append({
             "frame": fpath.stem,
-            "height": h,
-            "width": w,
+            "height": snippet_h,
+            "width": snippet_w,
             "masks": masks,
         })
 
@@ -931,10 +970,6 @@ def parse_args():
     parser.add_argument(
         "--tool-reprompt-interval", type=int, default=20,
         help="Frames between tool re-prompt attempts (default: 20)",
-    )
-    parser.add_argument(
-        "--area-window", type=int, default=60,
-        help="Rolling window for area degradation detection (default: 60)",
     )
     parser.add_argument(
         "--gt-erode-px", type=int, default=3,
@@ -1047,7 +1082,6 @@ def main():
             tissue_min_area=args.tissue_min_area,
             test_frames=args.test,
             reprompt_interval=args.tool_reprompt_interval,
-            area_window=args.area_window,
             gt_erode_px=args.gt_erode_px,
         )
 
