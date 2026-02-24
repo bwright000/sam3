@@ -62,6 +62,11 @@ GT_CAT_MAP = {"Liver": "liver", "Gallbladder": "gallbladder"}
 TISSUE_OBJ_IDS = {"Liver": 1, "Gallbladder": 2}
 OBJ_ID_TO_KEY = {1: "liver", 2: "gallbladder"}
 
+# Tool detection: text prompts tried in order of specificity.
+# SAM3's text-guided detection responds better to descriptive terms
+# than abstract ones. We cascade until detections are found.
+TOOL_PROMPTS = ["surgical instrument", "grasper", "tool"]
+
 
 # ---------------------------------------------------------------------------
 # Split detection and GT keyframe identification
@@ -523,17 +528,17 @@ def process_tools(
     gt_keyframes,
     split_size,
     effective_frames,
-    min_area=5000,
+    min_area=2000,
     reprompt_interval=20,
 ):
     """
-    Detect tools using text prompt "tool" per split segment.
+    Detect tools using multi-prompt cascade per split segment.
 
     For each split:
-    1. Try text prompt "tool" at the split's start frame
-    2. Check if 1-2 tool masks detected
-    3. If not, try at +20, +40, etc. within the split
-    4. Once tools found, propagate forward through the split
+    1. Try text prompts in order of specificity (TOOL_PROMPTS) at the split's start
+    2. Accept the first prompt that produces valid masks above min_area
+    3. If no prompt works, re-prompt at +20, +40, etc. within the split
+    4. Once tools found, propagate bidirectionally through the split
     5. Collect tool masks for all frames in the split
 
     Args:
@@ -543,7 +548,7 @@ def process_tools(
         gt_keyframes: list of (local_idx, video_frame_num) tuples
         split_size: frames per split
         effective_frames: number of frames to process
-        min_area: minimum mask area in pixels
+        min_area: minimum mask area in pixels (default 2000)
         reprompt_interval: frames between re-prompt attempts
 
     Returns:
@@ -588,25 +593,38 @@ def process_tools(
             if prompt_idx >= effective_frames:
                 break
 
-            # add_prompt resets state internally, so each attempt is fresh
-            response = predictor.add_prompt(
-                session_id=sid, frame_idx=prompt_idx, text="tool"
-            )
-            outputs = response["outputs"]
-
-            # Check how many tool masks were detected
-            binary_masks = outputs.get("out_binary_masks", [])
+            # Multi-prompt cascade: try each text prompt in order of specificity
             n_tools = 0
-            if len(binary_masks) > 0:
-                for mask in binary_masks:
-                    if isinstance(mask, np.ndarray):
-                        area = float(mask.sum())
-                    else:
-                        area = float(mask.sum().item())
-                    if area >= min_area:
-                        n_tools += 1
+            best_prompt = None
+            for prompt_text in TOOL_PROMPTS:
+                # add_prompt resets state internally, so each attempt is fresh
+                response = predictor.add_prompt(
+                    session_id=sid, frame_idx=prompt_idx, text=prompt_text
+                )
+                outputs = response["outputs"]
 
-            print(f"      Prompt at frame {prompt_idx}: {n_tools} tools detected")
+                # Check how many tool masks were detected above min_area
+                binary_masks = outputs.get("out_binary_masks", [])
+                n_valid = 0
+                n_raw = len(binary_masks) if hasattr(binary_masks, '__len__') else 0
+                if n_raw > 0:
+                    for mask in binary_masks:
+                        if isinstance(mask, np.ndarray):
+                            area = float(mask.sum())
+                        else:
+                            area = float(mask.sum().item())
+                        if area >= min_area:
+                            n_valid += 1
+
+                if n_valid >= 1:
+                    n_tools = n_valid
+                    best_prompt = prompt_text
+                    print(f"      Prompt at frame {prompt_idx} (\"{prompt_text}\"): "
+                          f"{n_raw} raw, {n_tools} kept (min_area={min_area})")
+                    break  # use first successful prompt
+
+            if best_prompt is None:
+                print(f"      Prompt at frame {prompt_idx}: 0 tools detected")
 
             if n_tools >= 1:
                 # Tools found! Propagate bidirectionally through this split.
@@ -810,6 +828,11 @@ def process_snippet(
 
     # --- 2. Tissue: GT + tracker propagation ---
     tracker = predictor.model.tracker
+    # Share the detector's backbone so the tracker can compute image features
+    # on demand. The tracker is built with backbone=None (model_builder.py:448)
+    # and relies on the VG pipeline to provide cached features. When used
+    # standalone, we need it to compute features itself via forward_image().
+    tracker.backbone = predictor.model.detector.backbone
     tissue_results, fwd_scores = process_tissue(
         tracker, frame_files_eff, effective_frames,
         annotation_loader, gt_keyframes, min_area=tissue_min_area,
@@ -960,8 +983,8 @@ def parse_args():
         help="Process first N frames only (test mode)",
     )
     parser.add_argument(
-        "--min-area", type=int, default=5000,
-        help="Minimum tool mask area in pixels (default: 5000)",
+        "--min-area", type=int, default=2000,
+        help="Minimum tool mask area in pixels (default: 2000)",
     )
     parser.add_argument(
         "--tissue-min-area", type=int, default=500,
