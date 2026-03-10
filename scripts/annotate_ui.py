@@ -1142,6 +1142,37 @@ KEYBOARD_JS = """
 """
 
 
+def _build_theme():
+    """Dark clinical theme for surgical annotation UI."""
+    return gr.themes.Base(
+        primary_hue="teal",
+        secondary_hue="gray",
+        neutral_hue="slate",
+        spacing_size="sm",
+        radius_size="md",
+        font=("Inter", "system-ui", "sans-serif"),
+    ).set(
+        body_background_fill="#1a1a2e",
+        body_background_fill_dark="#1a1a2e",
+        body_text_color="#e0e0e0",
+        block_background_fill="#16213e",
+        block_border_width="1px",
+        block_border_color="#2a2a4a",
+        block_label_text_color="#a0b0c0",
+        block_title_text_color="#e0e0e0",
+        input_background_fill="#0f3460",
+        input_border_color="#2a2a4a",
+        input_border_color_focus="#00b4d8",
+        button_primary_background_fill="#00b4d8",
+        button_primary_background_fill_hover="#0096c7",
+        button_primary_text_color="#ffffff",
+        button_secondary_background_fill="#2a2a4a",
+        button_secondary_background_fill_hover="#3a3a5a",
+        button_secondary_text_color="#e0e0e0",
+        slider_color="#00b4d8",
+    )
+
+
 def build_ui(args, episodes=None):
     """Build the Gradio interface."""
     segments_dir = args.segments_dir
@@ -1151,9 +1182,8 @@ def build_ui(args, episodes=None):
 
     with gr.Blocks(title="SAM3 Annotation Tool") as demo:
         gr.Markdown("# SAM3 Interactive Annotation Tool")
-        gr.Markdown("Arrow keys: navigate frames | Click image: place points")
 
-        # --- Top row: episode/snippet selection ---
+        # --- Top section: episode/snippet selection ---
         with gr.Row():
             episode_dd = gr.Dropdown(
                 label="Episode",
@@ -1162,66 +1192,72 @@ def build_ui(args, episodes=None):
             )
             snippet_dd = gr.Dropdown(label="Snippet", choices=[])
             load_btn = gr.Button("Load Snippet", variant="primary")
-            status_box = gr.Textbox(label="Status", interactive=False, lines=3)
+        status_box = gr.Textbox(
+            label="Status", interactive=False, lines=3,
+            value="Arrow keys: navigate frames | Click image: place points",
+        )
 
-        # --- Frame display ---
+        # --- Frame viewer (always visible) ---
         frame_display = gr.Image(
             label="Frame (click to place points)",
             interactive=True,
             type="numpy",
             height=600,
+            elem_id="frame-display",
         )
-
-        # --- Frame navigation ---
         with gr.Row():
-            prev_btn = gr.Button("< Prev")
+            prev_btn = gr.Button("< Prev", scale=0)
             frame_slider = gr.Slider(
                 minimum=0, maximum=0, step=1, value=0, label="Frame Index"
             )
-            next_btn = gr.Button("Next >")
-            prev_gt_btn = gr.Button("< GT")
-            next_gt_btn = gr.Button("GT >")
+            next_btn = gr.Button("Next >", scale=0)
+            prev_gt_btn = gr.Button("< GT", scale=0)
+            next_gt_btn = gr.Button("GT >", scale=0)
             frame_info = gr.Textbox(label="Frame", interactive=False, scale=0)
 
-        # --- Annotation controls ---
-        with gr.Row():
-            category_dd = gr.Dropdown(
-                label="Category", choices=categories, value=categories[0] if categories else None
-            )
-            prompt_mode_radio = gr.Radio(
-                choices=["Point", "Box"], value="Point", label="Prompt Mode"
-            )
-            point_type = gr.Radio(
-                choices=["Positive", "Negative"], value="Positive", label="Point Type"
-            )
+        # --- Accordion: Annotate ---
+        with gr.Accordion("Annotate", open=True):
+            with gr.Row():
+                category_dd = gr.Dropdown(
+                    label="Category", choices=categories,
+                    value=categories[0] if categories else None, scale=2,
+                )
+                new_cat_textbox = gr.Textbox(
+                    label="New Category", placeholder="e.g. Tool_1", scale=1,
+                )
+                add_cat_btn = gr.Button("Add", scale=0)
+                prompt_mode_radio = gr.Radio(
+                    choices=["Point", "Box"], value="Point",
+                    label="Prompt Mode", scale=0,
+                )
+                point_type = gr.Radio(
+                    choices=["Positive", "Negative"], value="Positive",
+                    label="Point Type", scale=0,
+                )
+            with gr.Row():
+                preview_btn = gr.Button("Preview Mask")
+                approve_btn = gr.Button("Approve Mask", variant="primary")
+                undo_btn = gr.Button("Undo Point")
+                clear_btn = gr.Button("Clear Points")
+                clear_all_btn = gr.Button("Clear All", variant="stop")
+                load_gt_btn = gr.Button("Load GT (frame)")
+
+        # --- Accordion: Ground Truth ---
+        with gr.Accordion("Ground Truth", open=False):
+            with gr.Row():
+                load_all_gt_btn = gr.Button("Load All GT as Previews")
+                approve_all_btn = gr.Button("Approve All Previews", variant="primary")
+
+        # --- Accordion: Propagate & Export ---
+        with gr.Accordion("Propagate & Export", open=True):
             conf_slider = gr.Slider(
                 minimum=0.0, maximum=1.0, step=0.05, value=0.5,
-                label="Confidence Threshold"
+                label="Confidence Threshold",
             )
-
-        # --- Add category ---
-        with gr.Row():
-            new_cat_textbox = gr.Textbox(
-                label="New Category", placeholder="e.g. Tool_1", scale=2
-            )
-            add_cat_btn = gr.Button("Add Category", scale=1)
-
-        # --- Action buttons ---
-        with gr.Row():
-            preview_btn = gr.Button("Preview Mask")
-            undo_btn = gr.Button("Undo Point")
-            clear_btn = gr.Button("Clear Points")
-            clear_all_btn = gr.Button("Clear All")
-            approve_btn = gr.Button("Approve Mask", variant="primary")
-            load_gt_btn = gr.Button("Load GT (frame)")
-
-        # --- GT + Propagation ---
-        with gr.Row():
-            load_all_gt_btn = gr.Button("Load All GT as Previews")
-            approve_all_btn = gr.Button("Approve All Previews", variant="primary")
-            propagate_btn = gr.Button("Propagate (chunked)", variant="primary")
-            jump_low_btn = gr.Button("Next Low Confidence")
-            save_btn = gr.Button("Save Annotations", variant="stop")
+            with gr.Row():
+                propagate_btn = gr.Button("Propagate (chunked)", variant="primary")
+                jump_low_btn = gr.Button("Next Low Confidence")
+                save_btn = gr.Button("Save Annotations", variant="stop")
 
         # --- Event handlers ---
 
@@ -1453,4 +1489,5 @@ if __name__ == "__main__":
         server_port=args.port,
         share=args.share,
         max_threads=1,
+        theme=_build_theme(),
     )
