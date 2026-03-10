@@ -42,6 +42,21 @@ from scripts.shared_config import (
     DEFAULT_COLOR_RGB as DEFAULT_COLOR,
 )
 
+# Fallback colors for dynamically added categories
+_EXTRA_COLORS_RGB = [
+    (255, 0, 128), (128, 0, 255), (0, 200, 128),
+    (200, 100, 0), (100, 200, 255), (200, 200, 0),
+]
+
+
+def _get_category_color(cat):
+    """Get color for a category, with fallback for dynamic categories."""
+    if cat in CATEGORY_COLORS:
+        return CATEGORY_COLORS[cat]
+    idx = g_state["categories"].index(cat) if cat in g_state["categories"] else 0
+    return _EXTRA_COLORS_RGB[idx % len(_EXTRA_COLORS_RGB)]
+
+
 # ---------------------------------------------------------------------------
 # Global state (inference_state is not deepcopyable)
 # ---------------------------------------------------------------------------
@@ -59,6 +74,8 @@ g_state = {
     "cat_to_objid": {},        # category name -> obj_id
     "objid_to_cat": {},        # obj_id -> category name
     "points": {},              # category -> list of (x, y, label)
+    "boxes": {},               # category -> (x1, y1, x2, y2) or None
+    "box_first_click": None,   # pending first corner for two-click box: (x, y)
     "preview_masks": {},       # frame_idx -> {category: binary_mask}
     "approved_masks": {},      # frame_idx -> {category: binary_mask}
     "propagated_masks": {},    # frame_idx -> {category: binary_mask}
@@ -124,6 +141,7 @@ def _autosave():
         "points": {cat: pts for cat, pts in g_state["points"].items()},
         "approved_masks": _masks_to_serializable(g_state["approved_masks"]),
         "propagated_masks": _masks_to_serializable(g_state["propagated_masks"]),
+        "boxes": {cat: list(box) if box else None for cat, box in g_state["boxes"].items()},
         "confidence_log": g_state["confidence_log"],
         "low_conf_frames": g_state["low_conf_frames"],
         "timestamp": time.time(),
@@ -164,10 +182,20 @@ def _restore_autosave(height, width):
             data.get("snippet_id") != g_state["snippet_id"]):
         return None
 
+    # Restore dynamic categories that were added at runtime
+    for cat in data.get("categories", []):
+        if cat not in g_state["categories"]:
+            add_category(cat)
+
     # Restore points
     for cat, pts in data.get("points", {}).items():
         if cat in g_state["points"]:
             g_state["points"][cat] = pts
+
+    # Restore boxes
+    for cat, box in data.get("boxes", {}).items():
+        if cat in g_state["boxes"]:
+            g_state["boxes"][cat] = tuple(box) if box else None
 
     # Restore masks
     g_state["approved_masks"] = _masks_from_serializable(
@@ -283,6 +311,8 @@ def load_snippet(segments_dir, episode, snippet_id, categories):
     g_state["cat_to_objid"] = cat_to_objid
     g_state["objid_to_cat"] = objid_to_cat
     g_state["points"] = {cat: [] for cat in categories}
+    g_state["boxes"] = {cat: None for cat in categories}
+    g_state["box_first_click"] = None
     g_state["preview_masks"] = {}
     g_state["approved_masks"] = {}
     g_state["propagated_masks"] = {}
@@ -335,7 +365,7 @@ def render_frame(frame_idx, show_gt=True, show_points=True, show_approved=True,
         gt_masks = g_state["annotation_loader"].get_frame_masks_by_frame_num(frame_num)
         if gt_masks is not None:
             for cat_name, mask in gt_masks.items():
-                color = np.array(CATEGORY_COLORS.get(cat_name, DEFAULT_COLOR), dtype=np.uint8)
+                color = np.array(_get_category_color(cat_name), dtype=np.uint8)
                 mask_bool = mask.astype(bool)
                 overlay = frame.copy()
                 overlay[mask_bool] = color
@@ -348,7 +378,7 @@ def render_frame(frame_idx, show_gt=True, show_points=True, show_approved=True,
     # Layer 2: Propagated masks
     if show_propagated and frame_idx in g_state["propagated_masks"]:
         for cat, mask in g_state["propagated_masks"][frame_idx].items():
-            color = np.array(CATEGORY_COLORS.get(cat, DEFAULT_COLOR), dtype=np.uint8)
+            color = np.array(_get_category_color(cat), dtype=np.uint8)
             mask_bool = mask.astype(bool)
             overlay = frame.copy()
             overlay[mask_bool] = color
@@ -361,7 +391,7 @@ def render_frame(frame_idx, show_gt=True, show_points=True, show_approved=True,
     # Layer 3: Preview masks (unapproved — shown with dashed/thin contour)
     if show_preview and frame_idx in g_state["preview_masks"]:
         for cat, mask in g_state["preview_masks"][frame_idx].items():
-            color = np.array(CATEGORY_COLORS.get(cat, DEFAULT_COLOR), dtype=np.uint8)
+            color = np.array(_get_category_color(cat), dtype=np.uint8)
             mask_bool = mask.astype(bool)
             overlay = frame.copy()
             overlay[mask_bool] = color
@@ -375,7 +405,7 @@ def render_frame(frame_idx, show_gt=True, show_points=True, show_approved=True,
     # Layer 4: Approved masks (user-confirmed — thick white+color contour)
     if show_approved and frame_idx in g_state["approved_masks"]:
         for cat, mask in g_state["approved_masks"][frame_idx].items():
-            color = np.array(CATEGORY_COLORS.get(cat, DEFAULT_COLOR), dtype=np.uint8)
+            color = np.array(_get_category_color(cat), dtype=np.uint8)
             mask_bool = mask.astype(bool)
             overlay = frame.copy()
             overlay[mask_bool] = color
@@ -389,7 +419,7 @@ def render_frame(frame_idx, show_gt=True, show_points=True, show_approved=True,
     # Layer 5: Current click points
     if show_points:
         for cat, pts in g_state["points"].items():
-            color = CATEGORY_COLORS.get(cat, DEFAULT_COLOR)
+            color = _get_category_color(cat)
             for x, y, label in pts:
                 marker_color = color if label == 1 else (128, 128, 128)
                 if label == 1:
@@ -402,11 +432,28 @@ def render_frame(frame_idx, show_gt=True, show_points=True, show_approved=True,
                     cv2.line(frame, (int(x) - 5, int(y) + 5),
                              (int(x) + 5, int(y) - 5), marker_color, 2)
 
+    # Layer 6: Bounding boxes
+    if show_points:
+        for cat, box in g_state["boxes"].items():
+            if box is None:
+                continue
+            color = _get_category_color(cat)
+            x1, y1, x2, y2 = box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, f"{cat} box", (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        # Draw pending first corner marker
+        if g_state["box_first_click"] is not None:
+            bx, by = g_state["box_first_click"]
+            cv2.drawMarker(frame, (bx, by), (255, 255, 255),
+                           cv2.MARKER_CROSS, 15, 2)
+
     # Legend
     y_pos = 25
     for cat in g_state["categories"]:
-        color = CATEGORY_COLORS.get(cat, DEFAULT_COLOR)
+        color = _get_category_color(cat)
         n_pts = len(g_state["points"].get(cat, []))
+        has_box = g_state["boxes"].get(cat) is not None
         has_approved = frame_idx in g_state["approved_masks"] and cat in g_state["approved_masks"][frame_idx]
         has_preview = frame_idx in g_state["preview_masks"] and cat in g_state["preview_masks"][frame_idx]
         has_prop = frame_idx in g_state["propagated_masks"] and cat in g_state["propagated_masks"][frame_idx]
@@ -417,6 +464,10 @@ def render_frame(frame_idx, show_gt=True, show_points=True, show_approved=True,
             status = " [preview]"
         elif has_prop:
             status = " [propagated]"
+        elif has_box and n_pts > 0:
+            status = f" [box + {n_pts} pts]"
+        elif has_box:
+            status = " [box]"
         elif n_pts > 0:
             status = f" [{n_pts} pts]"
         label = f"{cat}{status}"
@@ -454,8 +505,9 @@ def preview_mask(frame_idx, category):
         return render_frame(frame_idx), "Model not loaded"
 
     pts = g_state["points"].get(category, [])
-    if not pts:
-        return render_frame(frame_idx), "No points placed for this category"
+    box = g_state["boxes"].get(category)
+    if not pts and box is None:
+        return render_frame(frame_idx), "No points or box placed for this category"
 
     # Always reinitialize tracker state for preview to avoid state lock
     # (propagate_in_video_preflight locks the state, preventing new obj_ids)
@@ -472,20 +524,22 @@ def preview_mask(frame_idx, category):
     obj_id = g_state["cat_to_objid"][category]
     state = g_state["tracker_state"]
 
-    # Convert points
-    points_xy = [[p[0], p[1]] for p in pts]
-    labels = [p[2] for p in pts]
+    # Build kwargs for add_new_points_or_box (supports points, box, or both)
+    prompt_kwargs = {
+        "inference_state": state,
+        "frame_idx": frame_idx,
+        "obj_id": obj_id,
+        "rel_coordinates": False,
+        "clear_old_points": True,
+    }
+    if box is not None:
+        prompt_kwargs["box"] = [list(box)]  # [[x1, y1, x2, y2]]
+    if pts:
+        prompt_kwargs["points"] = [[p[0], p[1]] for p in pts]
+        prompt_kwargs["labels"] = [p[2] for p in pts]
 
     try:
-        tracker.add_new_points_or_box(
-            inference_state=state,
-            frame_idx=frame_idx,
-            obj_id=obj_id,
-            points=points_xy,
-            labels=labels,
-            rel_coordinates=False,
-            clear_old_points=True,
-        )
+        tracker.add_new_points_or_box(**prompt_kwargs)
 
         # Run single frame inference
         tracker.propagate_in_video_preflight(state, run_mem_encoder=True)
@@ -570,16 +624,36 @@ def undo_last_point(category, frame_idx):
 
 
 def clear_points(category):
-    """Clear all points for a category."""
+    """Clear all points and box for a category."""
     g_state["points"][category] = []
-    return "Points cleared"
+    g_state["boxes"][category] = None
+    g_state["box_first_click"] = None
+    return "Points and box cleared"
 
 
 def clear_all_points():
-    """Clear points for all categories."""
+    """Clear points and boxes for all categories."""
     for cat in g_state["categories"]:
         g_state["points"][cat] = []
-    return "All points cleared"
+        g_state["boxes"][cat] = None
+    g_state["box_first_click"] = None
+    return "All points and boxes cleared"
+
+
+def add_category(name):
+    """Add a new category/object at runtime."""
+    name = name.strip()
+    if not name:
+        return "Enter a category name"
+    if name in g_state["categories"]:
+        return f"'{name}' already exists"
+    obj_id = max(g_state["cat_to_objid"].values(), default=0) + 1
+    g_state["categories"].append(name)
+    g_state["cat_to_objid"][name] = obj_id
+    g_state["objid_to_cat"][obj_id] = name
+    g_state["points"][name] = []
+    g_state["boxes"][name] = None
+    return f"Added '{name}' (obj_id={obj_id})"
 
 
 def _get_anchor_frames():
@@ -1114,6 +1188,9 @@ def build_ui(args, episodes=None):
             category_dd = gr.Dropdown(
                 label="Category", choices=categories, value=categories[0] if categories else None
             )
+            prompt_mode_radio = gr.Radio(
+                choices=["Point", "Box"], value="Point", label="Prompt Mode"
+            )
             point_type = gr.Radio(
                 choices=["Positive", "Negative"], value="Positive", label="Point Type"
             )
@@ -1122,7 +1199,13 @@ def build_ui(args, episodes=None):
                 label="Confidence Threshold"
             )
 
-        # --- Action buttons ---
+        # --- Add category ---
+        with gr.Row():
+            new_cat_textbox = gr.Textbox(
+                label="New Category", placeholder="e.g. Tool_1", scale=2
+            )
+            add_cat_btn = gr.Button("Add Category", scale=1)
+
         # --- Action buttons ---
         with gr.Row():
             preview_btn = gr.Button("Preview Mask")
@@ -1149,16 +1232,19 @@ def build_ui(args, episodes=None):
         def on_load(episode, snippet_id):
             if not episode or not snippet_id:
                 return (gr.update(), gr.update(), gr.update(),
-                        "Select episode and snippet first")
+                        gr.update(), "Select episode and snippet first")
             n_frames, msg = load_snippet(segments_dir, episode, snippet_id, categories)
             if n_frames is None:
-                return gr.update(), gr.update(), gr.update(), msg
+                return gr.update(), gr.update(), gr.update(), gr.update(), msg
 
             frame = render_frame(0)
+            # Return updated category dropdown in case autosave restored dynamic categories
+            cats = list(g_state["categories"])
             return (
                 frame,
                 gr.update(maximum=n_frames - 1, value=0),
                 f"0 / {n_frames}",
+                gr.update(choices=cats, value=cats[0] if cats else None),
                 msg,
             )
 
@@ -1180,15 +1266,48 @@ def build_ui(args, episodes=None):
         def on_next_gt(idx):
             return jump_to_gt(int(idx), "next")
 
-        def on_click(evt: gr.SelectData, frame_idx, category, pt_type):
+        def on_click(evt: gr.SelectData, frame_idx, category, pt_type, prompt_mode):
             if not g_state["frame_files"]:
                 return render_frame(0), "No snippet loaded"
             x, y = evt.index[0], evt.index[1]
-            label = 1 if pt_type == "Positive" else 0
-            g_state["points"][category].append((x, y, label))
-            frame = render_frame(int(frame_idx))
-            n_pts = len(g_state["points"][category])
-            return frame, f"{'+'if label == 1 else '-'} ({x}, {y}) for {category}. Total: {n_pts}"
+            frame_idx = int(frame_idx)
+
+            if prompt_mode == "Box":
+                if g_state["box_first_click"] is None:
+                    # First click: store corner 1
+                    g_state["box_first_click"] = (x, y)
+                    frame = render_frame(frame_idx)
+                    return frame, f"Box corner 1: ({x},{y}) for {category}. Click corner 2."
+                else:
+                    # Second click: complete the box
+                    x1, y1 = g_state["box_first_click"]
+                    bx1, by1 = min(x1, x), min(y1, y)
+                    bx2, by2 = max(x1, x), max(y1, y)
+                    g_state["boxes"][category] = (bx1, by1, bx2, by2)
+                    g_state["box_first_click"] = None
+                    frame = render_frame(frame_idx)
+                    return frame, f"Box for {category}: ({bx1},{by1})-({bx2},{by2})"
+            else:
+                # Point mode
+                label = 1 if pt_type == "Positive" else 0
+                g_state["points"][category].append((x, y, label))
+                frame = render_frame(frame_idx)
+                n_pts = len(g_state["points"][category])
+                return frame, f"{'+'if label == 1 else '-'} ({x}, {y}) for {category}. Total: {n_pts}"
+
+        def on_add_category(name, frame_idx):
+            if not name or not name.strip():
+                return gr.update(), gr.update(), "Enter a category name"
+            msg = add_category(name)
+            cats = list(g_state["categories"])
+            return (
+                gr.update(choices=cats, value=name.strip()),
+                render_frame(int(frame_idx)),
+                msg,
+            )
+
+        def on_category_change(cat):
+            g_state["box_first_click"] = None  # cancel pending box on category switch
 
         def on_preview(frame_idx, category):
             return preview_mask(int(frame_idx), category)
@@ -1237,7 +1356,7 @@ def build_ui(args, episodes=None):
 
         load_btn.click(
             on_load, [episode_dd, snippet_dd],
-            [frame_display, frame_slider, frame_info, status_box],
+            [frame_display, frame_slider, frame_info, category_dd, status_box],
         )
 
         frame_slider.change(on_slider_change, [frame_slider], [frame_display, frame_info])
@@ -1249,8 +1368,14 @@ def build_ui(args, episodes=None):
 
         frame_display.select(
             on_click,
-            [frame_slider, category_dd, point_type],
+            [frame_slider, category_dd, point_type, prompt_mode_radio],
             [frame_display, status_box],
+        )
+
+        category_dd.change(on_category_change, [category_dd], [])
+        add_cat_btn.click(
+            on_add_category, [new_cat_textbox, frame_slider],
+            [category_dd, frame_display, status_box],
         )
 
         preview_btn.click(on_preview, [frame_slider, category_dd], [frame_display, status_box])

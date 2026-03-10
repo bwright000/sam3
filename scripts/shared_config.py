@@ -51,7 +51,7 @@ CATEGORY_COLORS_BGR_LOWER = {k.lower(): v for k, v in CATEGORY_COLORS_BGR.items(
 DEFAULT_COLOR_BGR_LOWER = DEFAULT_COLOR_BGR
 
 # RGB versions for Gradio/PIL (auto-derived from BGR)
-CATEGORY_COLORS_RGB = {k: (b, g, r) for k, (b, g, r) in CATEGORY_COLORS_BGR.items()}
+CATEGORY_COLORS_RGB = {k: (r, g, b) for k, (b, g, r) in CATEGORY_COLORS_BGR.items()}
 DEFAULT_COLOR_RGB = tuple(reversed(DEFAULT_COLOR_BGR))
 
 # RGB with lowercase keys
