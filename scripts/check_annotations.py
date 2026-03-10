@@ -37,9 +37,10 @@ import numpy as np
 class COCOAnnotationLoader:
     """Load and index COCO-format annotations."""
 
-    def __init__(self, json_path: str, dataset_dir: str):
+    def __init__(self, json_path: str, dataset_dir: str, split_size: int = None):
         self.json_path = Path(json_path)
         self.dataset_dir = Path(dataset_dir)
+        self._explicit_split_size = split_size  # If set, skip auto-detection
         self.images = {}          # image_id -> image info
         self.annotations = {}     # image_id -> list of annotations
         self.categories = {}      # category_id -> category name
@@ -132,15 +133,18 @@ class COCOAnnotationLoader:
         different image_ids with different category annotations. We collect ALL
         image_ids per frame so get_frame_masks_by_frame_num returns complete masks.
         """
-        # Auto-detect split size from max filename offset
-        max_offset = 0
-        for img_info in self.images.values():
-            stem = Path(img_info["file_name"]).stem
-            try:
-                max_offset = max(max_offset, int(stem))
-            except ValueError:
-                pass
-        split_size = max_offset + 1 if max_offset > 0 else 120  # fallback
+        # Use explicit split_size if provided, otherwise auto-detect
+        if self._explicit_split_size is not None:
+            split_size = self._explicit_split_size
+        else:
+            max_offset = 0
+            for img_info in self.images.values():
+                stem = Path(img_info["file_name"]).stem
+                try:
+                    max_offset = max(max_offset, int(stem))
+                except ValueError:
+                    pass
+            split_size = max_offset + 1 if max_offset > 0 else 120  # fallback
         self._split_size = split_size
 
         self._frame_to_all_ids = defaultdict(list)

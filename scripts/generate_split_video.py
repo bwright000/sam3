@@ -12,20 +12,18 @@ The CRCD dataset provides human-annotated GT only for frame 0 of each split
   5. Renders overlays and stitches final video
 
 Usage:
-    # Single snippet
+    # Using per-snippet annotations (from update_snippets.py, preferred)
     python scripts/generate_split_video.py \\
-        --segments-dir data/Segments --episode F_3 --snippet 1 \\
-        --tissue-seg-dir "F:\\2026 vibes\\MPHY Project\\annotated_dataset\\tissue_segmentation"
+        --segments-dir data/Segments --episode F_3 --snippet 1
 
-    # All snippets for an episode
+    # Using episode-level annotations (fallback)
     python scripts/generate_split_video.py \\
         --segments-dir data/Segments --episode F_3 \\
-        --tissue-seg-dir "F:\\2026 vibes\\MPHY Project\\annotated_dataset\\tissue_segmentation"
+        --tissue-seg-dir "path/to/tissue_segmentation"
 
     # Test mode (first N frames)
     python scripts/generate_split_video.py \\
-        --segments-dir data/Segments --episode F_3 --snippet 1 --test 100 \\
-        --tissue-seg-dir "F:\\2026 vibes\\MPHY Project\\annotated_dataset\\tissue_segmentation"
+        --segments-dir data/Segments --episode F_3 --snippet 1 --test 100
 """
 
 import argparse
@@ -48,6 +46,7 @@ from scripts.generate_tool_masks import (
     CATEGORY_COLORS,
     DEFAULT_COLOR,
 )
+from scripts.check_annotations import COCOAnnotationLoader
 from scripts.generate_tool_masks_video import (
     load_video_model,
     _convert_video_output,
@@ -55,6 +54,32 @@ from scripts.generate_tool_masks_video import (
 )
 
 from sam3.model.sam3_video_predictor import Sam3VideoPredictor
+
+
+
+# ---------------------------------------------------------------------------
+# Per-snippet annotation loading
+# ---------------------------------------------------------------------------
+
+def load_snippet_annotations(snippet_dir, split_size=None):
+    """
+    Load annotations from snippet_annotations.json (created by update_snippets.py).
+
+    Returns a COCOAnnotationLoader or None if the file doesn't exist.
+    Much more memory-efficient than loading full episode annotations,
+    since each snippet only contains its own frame range.
+
+    split_size: if provided, used instead of auto-detection (critical for C_1
+    where broken filenames cause incorrect auto-detection).
+    """
+    ann_path = snippet_dir / "snippet_annotations.json"
+    if not ann_path.exists():
+        return None
+
+    loader = COCOAnnotationLoader(str(ann_path), str(snippet_dir), split_size=split_size)
+    loader.load()
+    return loader
+
 
 # Tissue categories
 TISSUE_CATEGORIES = ["liver", "gallbladder"]
@@ -66,6 +91,188 @@ OBJ_ID_TO_KEY = {1: "liver", 2: "gallbladder"}
 # SAM3's text-guided detection responds better to descriptive terms
 # than abstract ones. We cascade until detections are found.
 TOOL_PROMPTS = ["surgical instrument", "grasper", "tool"]
+
+
+# ---------------------------------------------------------------------------
+# Tool gap detection and recovery
+# ---------------------------------------------------------------------------
+
+def find_tool_gaps(tool_results, split_start, split_end, min_gap_length=3):
+    """
+    Find contiguous frame regions within a split where tools are absent
+    but should be present (bounded by frames that DO have tools).
+
+    Only returns "internal" gaps — regions with tool-containing frames both
+    before and after. This avoids flagging the start/end of a split where
+    tools may genuinely be off-screen.
+
+    Args:
+        tool_results: dict {frame_idx: [mask_data_dict, ...]}
+        split_start: first frame index of the split (inclusive)
+        split_end: last frame index of the split (exclusive)
+        min_gap_length: ignore gaps shorter than this (transient losses)
+
+    Returns:
+        List of (gap_start, gap_end) tuples (inclusive on both ends).
+    """
+    # Build a boolean array: True = has tool masks
+    has_tools = []
+    for fidx in range(split_start, split_end):
+        has_tools.append(fidx in tool_results and len(tool_results[fidx]) > 0)
+
+    if not any(has_tools):
+        return []  # no tools at all in split — nothing to recover
+
+    # Find contiguous empty regions
+    gaps = []
+    gap_start = None
+    for i, has in enumerate(has_tools):
+        fidx = split_start + i
+        if not has:
+            if gap_start is None:
+                gap_start = fidx
+        else:
+            if gap_start is not None:
+                gap_end = fidx - 1  # inclusive
+                gaps.append((gap_start, gap_end))
+                gap_start = None
+    # Don't close a gap that extends to the end of the split (trailing gap)
+
+    # Filter: only keep internal gaps (tools present both before AND after)
+    # Trailing and leading gaps are excluded by construction:
+    # - leading gaps: first frame has no tools → gap_start=split_start, but no
+    #   tool frame before it → excluded
+    # - trailing gaps: not added (loop above doesn't close them)
+    # But also explicitly filter by min_gap_length
+    filtered = []
+    for gs, ge in gaps:
+        if (ge - gs + 1) >= min_gap_length:
+            filtered.append((gs, ge))
+
+    return filtered
+
+
+def recover_tool_gaps(
+    predictor,
+    sid,
+    frame_files,
+    tool_results,
+    gaps,
+    split_start,
+    split_end,
+    effective_frames,
+    min_area,
+    reprompt_interval=10,
+):
+    """
+    Re-prompt the detector within each gap to recover lost tools.
+
+    For each gap:
+      1. Reset session (clean tracker state, keep loaded frames)
+      2. Try text prompts at intervals within the gap
+      3. Propagate from the first successful prompt
+      4. Merge: only fill frames that don't already have tool masks
+
+    Args:
+        predictor: Sam3VideoPredictor instance
+        sid: session ID (session already started, frames loaded)
+        frame_files: sorted frame file paths
+        tool_results: dict {frame_idx: [mask_dicts]} — modified in-place
+        gaps: list of (gap_start, gap_end) from find_tool_gaps
+        split_start, split_end: split boundaries
+        effective_frames: total frames being processed
+        min_area: minimum mask area in pixels
+        reprompt_interval: frames between re-prompt attempts within the gap
+
+    Returns:
+        Number of frames recovered.
+    """
+    total_recovered = 0
+
+    for gap_start, gap_end in gaps:
+        gap_len = gap_end - gap_start + 1
+
+        # Reset session for a clean recovery pass
+        predictor.reset_session(session_id=sid)
+
+        # Try prompting at intervals within the gap
+        recovery_found = False
+        for offset in range(0, gap_len, reprompt_interval):
+            recovery_frame = gap_start + offset
+            if recovery_frame >= effective_frames:
+                break
+
+            # Multi-prompt cascade (same order as initial detection)
+            best_prompt = None
+            for prompt_text in TOOL_PROMPTS:
+                response = predictor.add_prompt(
+                    session_id=sid, frame_idx=recovery_frame, text=prompt_text
+                )
+                outputs = response["outputs"]
+
+                binary_masks = outputs.get("out_binary_masks", [])
+                n_valid = 0
+                n_raw = len(binary_masks) if hasattr(binary_masks, '__len__') else 0
+                if n_raw > 0:
+                    for mask in binary_masks:
+                        if isinstance(mask, np.ndarray):
+                            area = float(mask.sum())
+                        else:
+                            area = float(mask.sum().item())
+                        if area >= min_area:
+                            n_valid += 1
+
+                if n_valid >= 1:
+                    best_prompt = prompt_text
+                    break
+
+            if best_prompt is None:
+                continue  # tool genuinely absent at this frame, try next offset
+
+            # Tools found — propagate through the gap (with some buffer)
+            buffer = 5
+            max_track = max(recovery_frame - gap_start, gap_end - recovery_frame) + buffer
+            recovered_in_gap = 0
+
+            for prop_response in predictor.propagate_in_video(
+                session_id=sid,
+                propagation_direction="both",
+                start_frame_idx=recovery_frame,
+                max_frame_num_to_track=max_track,
+            ):
+                fidx = prop_response["frame_index"]
+                # Only fill within the gap boundaries (with buffer for propagation)
+                if fidx < split_start or fidx >= split_end or fidx >= effective_frames:
+                    continue
+
+                # Only fill frames that don't already have tool masks
+                if fidx in tool_results and len(tool_results[fidx]) > 0:
+                    continue
+
+                result = _convert_video_output(
+                    prop_response["outputs"],
+                    frame_files[fidx],
+                    "tool",
+                    min_area,
+                )
+                tool_masks = result["masks"].get("tool", [])
+                if tool_masks:
+                    # Mark as recovered
+                    for md in tool_masks:
+                        md["source"] = "gap_recovery"
+                    tool_results[fidx] = tool_masks
+                    recovered_in_gap += 1
+
+            total_recovered += recovered_in_gap
+            print(f"        Gap [{gap_start}-{gap_end}]: re-prompted at frame "
+                  f"{recovery_frame} (\"{best_prompt}\"), recovered {recovered_in_gap} frames")
+            recovery_found = True
+            break  # done with this gap
+
+        if not recovery_found:
+            print(f"        Gap [{gap_start}-{gap_end}]: no tools found during recovery")
+
+    return total_recovered
 
 
 # ---------------------------------------------------------------------------
@@ -532,14 +739,15 @@ def process_tools(
     reprompt_interval=20,
 ):
     """
-    Detect tools using multi-prompt cascade per split segment.
+    Detect tools using multi-prompt cascade per split segment, with gap recovery.
 
     For each split:
     1. Try text prompts in order of specificity (TOOL_PROMPTS) at the split's start
     2. Accept the first prompt that produces valid masks above min_area
     3. If no prompt works, re-prompt at +20, +40, etc. within the split
     4. Once tools found, propagate bidirectionally through the split
-    5. Collect tool masks for all frames in the split
+    5. Detect gaps where tools were lost mid-split
+    6. Re-prompt within gaps to recover lost tools
 
     Args:
         predictor: Sam3VideoPredictor instance
@@ -649,11 +857,33 @@ def process_tools(
                     )
                     tool_masks = result["masks"].get("tool", [])
                     if tool_masks:
+                        for md in tool_masks:
+                            md["source"] = "initial_detection"
                         tool_results[fidx] = tool_masks
 
                 tools_found = True
                 frames_with = sum(1 for fidx in range(split_start, split_end) if fidx in tool_results)
                 print(f"      Tools tracked for {frames_with}/{split_len} frames in split")
+
+                # --- Gap detection and recovery ---
+                gaps = find_tool_gaps(tool_results, split_start, split_end)
+                if gaps:
+                    print(f"      Tool gaps detected: {len(gaps)} region(s)")
+                    for gs, ge in gaps:
+                        print(f"        [{gs}-{ge}] ({ge - gs + 1} frames)")
+
+                    recovered = recover_tool_gaps(
+                        predictor, sid, frame_files, tool_results,
+                        gaps, split_start, split_end, effective_frames,
+                        min_area, reprompt_interval=min(reprompt_interval, 10),
+                    )
+                    if recovered:
+                        frames_with = sum(
+                            1 for f in range(split_start, split_end) if f in tool_results
+                        )
+                        print(f"      After recovery: {frames_with}/{split_len} frames "
+                              f"({recovered} recovered)")
+
                 break
 
         if not tools_found:
@@ -662,7 +892,18 @@ def process_tools(
     predictor.close_session(session_id=sid)
 
     total_frames_with_tools = len(tool_results)
+    initial_count = sum(
+        1 for masks in tool_results.values()
+        for m in masks if m.get("source") == "initial_detection"
+    )
+    recovery_count = sum(
+        1 for masks in tool_results.values()
+        for m in masks if m.get("source") == "gap_recovery"
+    )
     print(f"\n  Tool detection done: tools on {total_frames_with_tools}/{effective_frames} frames")
+    if recovery_count:
+        print(f"    Initial detections: {initial_count} masks, "
+              f"gap recoveries: {recovery_count} masks")
 
     return tool_results
 
@@ -971,8 +1212,9 @@ def parse_args():
         help="Specific snippet number (default: all)",
     )
     parser.add_argument(
-        "--tissue-seg-dir", required=True,
-        help="Path to tissue_segmentation directory with GT annotations",
+        "--tissue-seg-dir", default=None,
+        help="Path to tissue_segmentation directory with GT annotations. "
+             "Optional if snippets have snippet_annotations.json (from update_snippets.py)",
     )
     parser.add_argument(
         "--output-dir", default="outputs/split_video",
@@ -1013,12 +1255,13 @@ def main():
     args = parse_args()
     segments_dir = Path(args.segments_dir)
     output_dir = Path(args.output_dir)
-    tissue_seg_dir = Path(args.tissue_seg_dir)
 
     if not segments_dir.exists():
         print(f"ERROR: Segments directory not found: {segments_dir}")
         sys.exit(1)
-    if not tissue_seg_dir.exists():
+
+    tissue_seg_dir = Path(args.tissue_seg_dir) if args.tissue_seg_dir else None
+    if tissue_seg_dir and not tissue_seg_dir.exists():
         print(f"ERROR: Tissue segmentation directory not found: {tissue_seg_dir}")
         sys.exit(1)
 
@@ -1045,6 +1288,43 @@ def main():
         print("ERROR: No snippets found")
         sys.exit(1)
 
+    # Load snippet metadata for split_size (auto-detection is unreliable for C_1)
+    snippets_json_path = ep_dir / f"{args.episode}_snippets.json"
+    metadata_split_size = None
+    if snippets_json_path.exists():
+        with open(snippets_json_path) as f:
+            snippets_meta = json.load(f)
+        for s in snippets_meta:
+            if "split_size" in s:
+                metadata_split_size = s["split_size"]
+                break
+        if metadata_split_size:
+            print(f"Split size from metadata: {metadata_split_size}")
+
+    # Check annotation strategy: per-snippet vs episode-level
+    has_snippet_anns = any(
+        (s / "snippet_annotations.json").exists() for s in snippet_list
+    )
+    use_snippet_anns = has_snippet_anns  # prefer per-snippet when available
+
+    if use_snippet_anns:
+        print(f"\nUsing per-snippet annotations (snippet_annotations.json)")
+    elif tissue_seg_dir:
+        print(f"\nUsing episode-level annotations from {tissue_seg_dir}")
+    else:
+        print(f"ERROR: No snippet_annotations.json found and --tissue-seg-dir not provided")
+        sys.exit(1)
+
+    # Load episode-level annotations as fallback (only if needed)
+    episode_loader = None
+    episode_split_size = None
+    if tissue_seg_dir:
+        print(f"Loading episode GT annotations from {tissue_seg_dir}...")
+        episode_loader = _load_episode_annotations(tissue_seg_dir, args.episode)
+        if episode_loader:
+            episode_split_size = detect_split_size(episode_loader)
+            print(f"Detected split size: {episode_split_size}")
+
     # Count frames
     total_frames = 0
     for snip_dir in snippet_list:
@@ -1068,16 +1348,6 @@ def main():
     if args.test:
         print(f"Test mode: {args.test} frames per snippet")
 
-    # Load GT annotations
-    print(f"\nLoading GT annotations from {tissue_seg_dir}...")
-    annotation_loader = _load_episode_annotations(tissue_seg_dir, args.episode)
-    if annotation_loader is None:
-        print(f"ERROR: No annotations found for {args.episode}")
-        sys.exit(1)
-
-    split_size = detect_split_size(annotation_loader)
-    print(f"Detected split size: {split_size}")
-
     # Load video model
     print()
     predictor = load_video_model(lora_checkpoint=args.lora_checkpoint)
@@ -1094,6 +1364,32 @@ def main():
             print(f"\n  Skipping {snippet_id} (results exist, --resume)")
             continue
 
+        # Load annotations for this snippet
+        annotation_loader = None
+        split_size = None
+
+        if use_snippet_anns:
+            annotation_loader = load_snippet_annotations(snip_dir, split_size=metadata_split_size)
+            if annotation_loader:
+                split_size = metadata_split_size or detect_split_size(annotation_loader)
+                print(f"\n  Loaded snippet annotations: "
+                      f"{len(annotation_loader.images)} images, "
+                      f"split_size={split_size}")
+
+        # Fall back to episode-level if snippet annotations unavailable
+        if annotation_loader is None:
+            if episode_loader is None and tissue_seg_dir:
+                print(f"\n  Loading episode annotations (fallback)...")
+                episode_loader = _load_episode_annotations(tissue_seg_dir, args.episode)
+                if episode_loader:
+                    episode_split_size = detect_split_size(episode_loader)
+            annotation_loader = episode_loader
+            split_size = episode_split_size
+
+        if annotation_loader is None:
+            print(f"\n  ERROR: No annotations available for {snippet_id}, skipping")
+            continue
+
         process_snippet(
             predictor=predictor,
             snippet_dir=snip_dir,
@@ -1107,6 +1403,10 @@ def main():
             reprompt_interval=args.tool_reprompt_interval,
             gt_erode_px=args.gt_erode_px,
         )
+
+        # Free snippet-level loader after processing (memory efficiency)
+        if use_snippet_anns and annotation_loader is not episode_loader:
+            del annotation_loader
 
     total_time = time.time() - t_total
     print(f"\n{'=' * 60}")
