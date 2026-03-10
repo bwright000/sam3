@@ -34,12 +34,10 @@ RESULTS_JSON = ROOT / "outputs" / "segments" / EPISODE / SNIPPET / f"{SNIPPET}_r
 FRAME_PATH = SEGMENTS_DIR / "frames_left" / f"{FRAME}.webp"
 OUTPUT_DIR = ROOT / "outputs" / "segments" / EPISODE / SNIPPET / "layer_extracts"
 
-CATEGORY_COLORS = {
-    "liver": (0, 0, 255),        # Red (BGR)
-    "gallbladder": (0, 255, 0),  # Green (BGR)
-    "tool": (255, 128, 0),       # Blue (BGR)
-}
-GT_CAT_MAP = {"Liver": "liver", "Gallbladder": "gallbladder"}
+from scripts.shared_config import (
+    CATEGORY_COLORS_BGR_LOWER as CATEGORY_COLORS,
+    GT_CAT_MAP,
+)
 
 
 def draw_mask_layer(img_bgr, mask_uint8, color):

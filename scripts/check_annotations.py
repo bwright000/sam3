@@ -437,16 +437,11 @@ class QualityMetrics:
 # Visualization
 # ---------------------------------------------------------------------------
 
-# Colors: BGR for OpenCV
-CATEGORY_COLORS = {
-    "Liver": (0, 0, 255),        # Red
-    "Gallbladder": (0, 255, 0),  # Green
-    "Meat": (0, 165, 255),       # Orange
-    "Skin": (203, 192, 255),     # Pink
-    "FBF": (255, 0, 0),          # Blue
-    "PCH": (255, 255, 0),        # Cyan
-}
-DEFAULT_COLOR = (0, 255, 255)    # Yellow
+# Colors (from shared config — title-case BGR keys)
+from scripts.shared_config import (
+    CATEGORY_COLORS_BGR as CATEGORY_COLORS,
+    DEFAULT_COLOR_BGR as DEFAULT_COLOR,
+)
 
 
 def render_annotation_frame(

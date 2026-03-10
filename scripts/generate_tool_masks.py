@@ -558,13 +558,11 @@ def _merge_annotations_into(loader: COCOAnnotationLoader, json_path: Path):
 # Snippet processing (Segments mode)
 # ---------------------------------------------------------------------------
 
-# Color palette for text-prompted categories (BGR)
-CATEGORY_COLORS = {
-    "liver": (0, 0, 255),        # Red
-    "gallbladder": (0, 255, 0),  # Green
-    "tool": (255, 128, 0),       # Blue
-}
-DEFAULT_COLOR = (0, 255, 255)    # Yellow
+# Color palette (from shared config — lowercase BGR keys)
+from scripts.shared_config import (
+    CATEGORY_COLORS_BGR_LOWER as CATEGORY_COLORS,
+    DEFAULT_COLOR_BGR as DEFAULT_COLOR,
+)
 
 
 def _run_frame_inference(processor, frame_path, prompts, min_area):
@@ -818,7 +816,7 @@ def _render_overlay_from_results(frame_path, frame_result, prompts, annotation_l
     h, w = overlay_frame.shape[:2]
 
     # Map GT category names (title-case) to our color keys (lowercase)
-    GT_CAT_MAP = {"Liver": "liver", "Gallbladder": "gallbladder"}
+    from scripts.shared_config import GT_CAT_MAP
     gt_masks = {}
 
     # --- Layer 1: GT tissue masks (bottom layer) ---
@@ -874,7 +872,11 @@ def _render_overlay_from_results(frame_path, frame_result, prompts, annotation_l
         if gt_cat in gt_masks:
             legend_masks[color_key] = [{"_gt": True}]  # count = 1 per GT category
     legend_masks.update(frame_result["masks"])
-    all_legend_keys = list(GT_CAT_MAP.values()) + prompts
+    # Deduplicate: GT categories that also appear in prompts should only show once
+    all_legend_keys = list(GT_CAT_MAP.values())
+    for p in prompts:
+        if p not in all_legend_keys:
+            all_legend_keys.append(p)
     _draw_legend(overlay_frame, all_legend_keys, legend_masks)
 
     return frame_result, overlay_frame, 0

@@ -20,14 +20,7 @@ from scripts.check_annotations import COCOAnnotationLoader
 BASE_DIR = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = BASE_DIR / "outputs" / "gt_verify"
 
-CATEGORY_COLORS_BGR = {
-    "Liver": (0, 0, 255),
-    "Gallbladder": (0, 255, 0),
-    "Meat": (0, 165, 255),
-    "Skin": (203, 192, 255),
-    "FBF": (255, 0, 0),
-    "PCH": (255, 255, 0),
-}
+from scripts.shared_config import CATEGORY_COLORS_BGR
 
 # Episodes to check with their snippet directories
 EPISODES = {

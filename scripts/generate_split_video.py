@@ -81,11 +81,9 @@ def load_snippet_annotations(snippet_dir, split_size=None):
     return loader
 
 
-# Tissue categories
-TISSUE_CATEGORIES = ["liver", "gallbladder"]
-GT_CAT_MAP = {"Liver": "liver", "Gallbladder": "gallbladder"}
-TISSUE_OBJ_IDS = {"Liver": 1, "Gallbladder": 2}
-OBJ_ID_TO_KEY = {1: "liver", 2: "gallbladder"}
+# Tissue categories (from shared config)
+from scripts.shared_config import GT_CAT_MAP, TISSUE_OBJ_IDS, OBJ_ID_TO_KEY
+TISSUE_CATEGORIES = list(GT_CAT_MAP.values())
 
 # Tool detection: text prompts tried in order of specificity.
 # SAM3's text-guided detection responds better to descriptive terms

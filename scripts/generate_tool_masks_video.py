@@ -72,11 +72,9 @@ from sam3.model.sam3_video_predictor import Sam3VideoPredictor
 # For loading frames (supports .webp, .png, .jpg etc. via PIL)
 from sam3.model.io_utils import _load_img_as_tensor
 
-# Color palette: "tool" already blue from generate_tool_masks.py
-
-# Tissue categories for GT and propagation
-TISSUE_CATEGORIES = ["liver", "gallbladder"]
-GT_CAT_MAP = {"Liver": "liver", "Gallbladder": "gallbladder"}
+# Tissue categories (from shared config)
+from scripts.shared_config import GT_CAT_MAP
+TISSUE_CATEGORIES = list(GT_CAT_MAP.values())
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +316,7 @@ def _load_frames_for_tracker(frame_files, num_frames, image_size):
         img_std = img_std.cuda()
     images -= img_mean
     images /= img_std
+    del img_mean, img_std
     return images, video_height, video_width
 
 
