@@ -27,6 +27,10 @@ huggingface_hub
 
 # Image processing
 Pillow>=9.0.0
+opencv-python>=4.5.0
+
+# Interactive annotation UI
+gradio>=4.0.0
 
 # Optional: memory profiling
 psutil
