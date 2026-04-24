@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SAM3 Annotator</title>
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script src="https://unpkg.com/konva@9/konva.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <!-- Sidebar: episode / snippet picker + categories -->
+    <aside id="sidebar">
+      <div class="block">
+        <div class="label">Episode</div>
+        <select id="episode-dd"></select>
+      </div>
+      <div class="block">
+        <div class="label">Snippet</div>
+        <select id="snippet-dd"></select>
+      </div>
+      <div class="block">
+        <button id="load-btn" class="btn primary">Load Snippet</button>
+      </div>
+      <div class="block">
+        <div class="label">Categories</div>
+        <div id="cat-list"></div>
+        <div class="row">
+          <input id="new-cat" type="text" placeholder="New category">
+          <button id="add-cat" class="btn small">+</button>
+        </div>
+      </div>
+      <div class="block">
+        <div class="label">Propagate</div>
+        <div class="row">
+          <label>N frames:</label>
+          <input id="prop-n" type="number" value="120" min="1" max="600" style="width:60px">
+        </div>
+        <button id="prop-btn" class="btn primary full">Propagate</button>
+      </div>
+      <div class="block">
+        <button id="export-btn" class="btn accent full">Export Snippet</button>
+        <label class="row">
+          <input id="concat-tool" type="checkbox">
+          Concat Tool_* → Tool
+        </label>
+      </div>
+      <div class="block" id="status-box">Ready.</div>
+    </aside>
+
+    <!-- Central canvas area -->
+    <main id="center">
+      <div id="frame-toolbar">
+        <button id="prev-btn" class="btn small">◀</button>
+        <input id="frame-slider" type="range" min="0" max="0" value="0">
+        <button id="next-btn" class="btn small">▶</button>
+        <span id="frame-info">–</span>
+      </div>
+      <div id="canvas-wrap">
+        <div id="konva-container"></div>
+      </div>
+    </main>
+
+    <!-- Right toolbox -->
+    <aside id="toolbox">
+      <div class="tool-group">
+        <div class="label">Tool</div>
+        <button data-tool="brush" class="tool-btn active" title="Brush (B)">✏️<br>Brush</button>
+        <button data-tool="eraser" class="tool-btn" title="Eraser (E)">🧽<br>Eraser</button>
+        <button data-tool="sam-click" class="tool-btn" title="SAM3 Click (S)">🎯<br>SAM Click</button>
+        <button data-tool="sam-box" class="tool-btn" title="SAM3 Box (Shift+S)">📦<br>SAM Box</button>
+      </div>
+      <div class="tool-group">
+        <div class="label">Brush Size</div>
+        <input id="brush-size" type="range" min="1" max="80" value="12">
+        <span id="brush-size-val">12px</span>
+      </div>
+      <div class="tool-group">
+        <div class="label">Point Label</div>
+        <select id="point-label">
+          <option value="1">Positive</option>
+          <option value="0">Negative</option>
+        </select>
+      </div>
+      <div class="tool-group">
+        <div class="label">Active Category</div>
+        <select id="active-cat"></select>
+      </div>
+      <div class="tool-group">
+        <button id="preview-btn" class="btn full">Preview (SAM3)</button>
+        <button id="commit-btn" class="btn primary full" title="Enter">Commit Anchor</button>
+        <button id="clear-btn" class="btn full">Clear Edit Layer</button>
+        <button id="load-gt-btn" class="btn full">Load GT as Editable</button>
+      </div>
+      <div class="tool-group">
+        <div class="label">Layers</div>
+        <label><input type="checkbox" id="show-gt" checked> GT outlines</label>
+        <label><input type="checkbox" id="show-approved" checked> Approved</label>
+        <label><input type="checkbox" id="show-propagated" checked> Propagated</label>
+      </div>
+    </aside>
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

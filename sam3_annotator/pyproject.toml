@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sam3_annotator"
+version = "0.1.0"
+description = "Photoshop-style paint annotator for SAM3 video mask seeding"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "websockets>=12",
+    "pycocotools>=2.0",
+    "numpy>=1.26,<2",
+    "opencv-python>=4.5",
+    "Pillow>=9",
+    "python-multipart>=0.0.9",
+    "scikit-image>=0.22",
+]
+
+[project.scripts]
+sam3-annotator = "sam3_annotator.server.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sam3_annotator*"]
+
+[tool.setuptools.package-data]
+sam3_annotator = ["frontend/static/**/*", "frontend/templates/*"]
