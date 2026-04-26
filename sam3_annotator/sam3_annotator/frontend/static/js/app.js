@@ -41,6 +41,11 @@ const S = {
   samPoints: [],   // [{x, y, label}]
   samBox: null,    // [x1,y1,x2,y2]
   samBoxFirstClick: null,
+  // text-prompt detections (latest run)
+  textDets: [],    // [{idx, score, rle, box, pixels}]
+  // Categories whose GT is currently loaded onto the edit layer (so we hide
+  // the dashed GT outline for those — otherwise it looks un-erasable).
+  editingGT: new Set(),
   // undo stack: array of {type, payload}
   undoStack: [],
 };
@@ -52,20 +57,28 @@ const $ = (sel) => document.querySelector(sel);
 let stage, imageLayer, gtLayer, approvedLayer, propagatedLayer, editLayer, promptLayer;
 let displayScale = 1;  // canvas display size / original size
 
-function initKonva(width, height) {
-  // Fit the canvas within the central area
+function _calcStageSize(width, height) {
   const wrap = $('#canvas-wrap');
-  const maxW = wrap.clientWidth - 28;
-  const maxH = wrap.clientHeight - 28;
-  displayScale = Math.min(maxW / width, maxH / height, 1);
-  const dw = Math.round(width * displayScale);
-  const dh = Math.round(height * displayScale);
+  // Use a small inset so we don't blow past the wrap padding
+  const maxW = Math.max(120, wrap.clientWidth - 4);
+  const maxH = Math.max(120, wrap.clientHeight - 4);
+  const scale = Math.min(maxW / width, maxH / height, 1);
+  return {
+    scale,
+    w: Math.round(width * scale),
+    h: Math.round(height * scale),
+  };
+}
+
+function initKonva(width, height) {
+  const { scale, w, h } = _calcStageSize(width, height);
+  displayScale = scale;
 
   $('#konva-container').innerHTML = '';
   stage = new Konva.Stage({
     container: 'konva-container',
-    width: dw,
-    height: dh,
+    width: w,
+    height: h,
   });
   imageLayer = new Konva.Layer({ listening: false });
   gtLayer = new Konva.Layer({ listening: false });
@@ -79,6 +92,31 @@ function initKonva(width, height) {
   stage.on('mousedown touchstart', onPointerDown);
   stage.on('mousemove touchmove', onPointerMove);
   stage.on('mouseup touchend', onPointerUp);
+}
+
+// Re-fit the stage when viewport changes
+let _resizeTimer = null;
+function handleResize() {
+  if (!stage || !S.snippet) return;
+  clearTimeout(_resizeTimer);
+  _resizeTimer = setTimeout(() => {
+    const { scale, w, h } = _calcStageSize(S.width, S.height);
+    if (Math.abs(scale - displayScale) < 0.001 && w === stage.width() && h === stage.height()) return;
+    displayScale = scale;
+    stage.size({ width: w, height: h });
+    // Resize all layer Konva.Image children to fill new stage
+    [imageLayer, gtLayer, approvedLayer, propagatedLayer, editLayer, promptLayer].forEach(layer => {
+      layer.getChildren().forEach(node => {
+        if (node.className === 'Image') {
+          node.width(w);
+          node.height(h);
+        }
+      });
+      layer.batchDraw();
+    });
+    // Re-render overlays so polygons etc. use the new displayScale
+    renderOverlays();
+  }, 80);
 }
 
 function clearLayers() {
@@ -133,6 +171,7 @@ async function loadFrame(idx) {
   S.samPoints = [];
   S.samBox = null;
   S.samBoxFirstClick = null;
+  S.editingGT.clear();
   editLayer.batchDraw();
   promptLayer.batchDraw();
   S.undoStack = [];
@@ -146,6 +185,8 @@ async function loadFrame(idx) {
   S.approved = masksResp.approved || {};
   S.propagated = masksResp.propagated || {};
   renderOverlays();
+  // Re-render masks panel so per-frame view updates and counter reflects current frame
+  renderMasksList();
 }
 
 function updateFrameInfo() {
@@ -166,6 +207,9 @@ function renderOverlays() {
 
   if (S.showGt) {
     for (const [cat, polys] of Object.entries(S.gt)) {
+      // If the user has pulled this GT onto the edit layer, skip drawing the
+      // outline so the edit-layer raster is the only render of this mask.
+      if (S.editingGT.has(cat)) continue;
       const col = catColor(cat);
       for (const flat of polys) {
         const pts = flat.map(v => v * displayScale);
@@ -395,7 +439,9 @@ async function commitAnchor() {
     S.propagated = m.propagated || {};
     editLayer.destroyChildren();
     editLayer.batchDraw();
+    S.editingGT.delete(S.activeCategory);
     renderOverlays();
+    refreshMasksList();
   } catch (e) {
     setStatus(`commit failed: ${e.message}`);
   }
@@ -446,6 +492,154 @@ async function previewSAM() {
   }
 }
 
+// ---------- Text prompt ----------
+async function runTextPrompt() {
+  if (!S.snippet) return;
+  if (!S.activeCategory) { setStatus('pick an active category'); return; }
+  const text = $('#text-prompt').value.trim();
+  if (!text) { setStatus('enter a text prompt'); return; }
+  const conf = parseFloat($('#text-conf').value);
+  setStatus(`running text prompt "${text}" @ conf≥${conf.toFixed(2)} (loads image model on first call ~20s)…`);
+  try {
+    const r = await apiPost('/api/preview/text', {
+      frame_idx: S.frameIdx,
+      category: S.activeCategory,
+      text,
+      conf_threshold: conf,
+      max_results: 10,
+    });
+    S.textDets = (r.detections || []).map(d => ({ ...d, selected: false }));
+    renderTextDetections();
+    setStatus(`text returned ${r.detections.length}/${r.n_total} detections. Tick rows or click numbered overlays to select. Then Accept Selected.`);
+  } catch (e) {
+    setStatus(`text prompt failed: ${e.message}`);
+  }
+}
+
+function renderTextDetections() {
+  // Render all detections on edit layer with selection state encoded in opacity
+  editLayer.destroyChildren();
+  const list = $('#text-results');
+  list.innerHTML = '';
+  const col = hexToRgb(catColor(S.activeCategory));
+
+  S.textDets.forEach((d, i) => {
+    try {
+      const imgData = decodeRLE(d.rle);
+      const alpha = d.selected ? 200 : 100;
+      const r = d.selected ? col.r : 160;
+      const g = d.selected ? col.g : 160;
+      const b = d.selected ? col.b : 160;
+      for (let j = 0; j < imgData.data.length; j += 4) {
+        if (imgData.data[j+3] > 0) {
+          imgData.data[j] = r; imgData.data[j+1] = g; imgData.data[j+2] = b;
+          imgData.data[j+3] = alpha;
+        }
+      }
+      const cvs = document.createElement('canvas');
+      cvs.width = imgData.width; cvs.height = imgData.height;
+      cvs.getContext('2d').putImageData(imgData, 0, 0);
+      const ki = new Konva.Image({
+        image: cvs,
+        width: stage.width(),
+        height: stage.height(),
+        listening: true,
+      });
+      ki.setAttr('detIdx', i);
+      ki.on('click tap', () => toggleTextDetection(i));
+      editLayer.add(ki);
+
+      // Number + score badge
+      if (d.box && d.box.length === 4) {
+        const [x1, y1, x2, y2] = d.box;
+        const cx = (x1 + x2) / 2 * displayScale;
+        const cy = (y1 + y2) / 2 * displayScale;
+        const tag = new Konva.Label({ x: cx, y: cy, listening: true });
+        tag.add(
+          new Konva.Tag({
+            fill: d.selected ? 'rgba(0,180,216,0.85)' : 'rgba(0,0,0,0.7)',
+            cornerRadius: 3,
+          }),
+          new Konva.Text({
+            text: (d.selected ? '✓ ' : '') + `#${i} ${(d.score*100).toFixed(0)}%`,
+            fontSize: 13, padding: 3, fill: 'white',
+          })
+        );
+        tag.on('click tap', () => toggleTextDetection(i));
+        editLayer.add(tag);
+      }
+    } catch (e) { console.error('det render', e); }
+
+    // Sidebar list row
+    const row = document.createElement('label');
+    row.style.cssText = 'display:flex; align-items:center; gap:6px; padding:5px 6px; cursor:pointer; border-bottom:1px solid var(--border);';
+    row.innerHTML = `
+      <input type="checkbox" ${d.selected ? 'checked' : ''}>
+      <span style="flex:1">#${i} <b>${(d.score*100).toFixed(1)}%</b> · ${d.pixels}px</span>
+    `;
+    row.onmouseover = () => row.style.background = 'var(--panel-2)';
+    row.onmouseout = () => row.style.background = '';
+    row.querySelector('input').onchange = () => toggleTextDetection(i);
+    list.appendChild(row);
+  });
+  editLayer.batchDraw();
+}
+
+function toggleTextDetection(i) {
+  if (!S.textDets[i]) return;
+  S.textDets[i].selected = !S.textDets[i].selected;
+  renderTextDetections();
+}
+
+function selectAllText(val) {
+  S.textDets.forEach(d => { d.selected = val; });
+  renderTextDetections();
+}
+
+function acceptSelectedTextDets() {
+  const sel = S.textDets.filter(d => d.selected);
+  if (sel.length === 0) {
+    setStatus('no detections selected — tick at least one');
+    return;
+  }
+  // Decode all selected RLEs and union them into a single binary mask
+  const W = S.width, H = S.height;
+  const union = new Uint8Array(W * H);
+  for (const d of sel) {
+    const imgData = decodeRLE(d.rle);
+    const data = imgData.data;
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const di = (y * W + x) * 4;
+        if (data[di + 3] > 0) union[y * W + x] = 1;
+      }
+    }
+  }
+  // Render union as opaque edit layer mask
+  const out = new Uint8ClampedArray(W * H * 4);
+  const col = hexToRgb(catColor(S.activeCategory));
+  for (let i = 0; i < W * H; i++) {
+    if (union[i]) {
+      const di = i * 4;
+      out[di] = col.r; out[di+1] = col.g; out[di+2] = col.b; out[di+3] = 220;
+    }
+  }
+  const imgData = new ImageData(out, W, H);
+  const cvs = document.createElement('canvas');
+  cvs.width = W; cvs.height = H;
+  cvs.getContext('2d').putImageData(imgData, 0, 0);
+  editLayer.destroyChildren();
+  editLayer.add(new Konva.Image({
+    image: cvs, width: stage.width(), height: stage.height(),
+  }));
+  editLayer.batchDraw();
+  // Clear detection list
+  S.textDets = [];
+  $('#text-results').innerHTML = '';
+  const px = union.reduce((s, v) => s + v, 0);
+  setStatus(`accepted ${sel.length} detection(s) as union (${px}px) on edit layer. Refine with brush/eraser, then Commit.`);
+}
+
 // ---------- Propagate ----------
 async function propagate() {
   if (!S.snippet) return;
@@ -462,6 +656,7 @@ async function propagate() {
     S.propagated = m.propagated || {};
     S.approved = m.approved || {};
     renderOverlays();
+    refreshMasksList();
   } catch (e) {
     setStatus(`propagate failed: ${e.message}`);
   }
@@ -489,17 +684,249 @@ async function loadGTEditable() {
     setStatus(`no GT for ${S.activeCategory} at this frame`);
     return;
   }
+  // Rasterize polygon to a single Konva.Image so brush+eraser fully edit it
+  // (Konva.Line is a vector primitive; its stroke pixels are redrawn each frame
+  //  and would persist through eraser strokes. A raster image is fully editable.)
   editLayer.destroyChildren();
+  const W = S.width, H = S.height;
+  const cvs = document.createElement('canvas');
+  cvs.width = W; cvs.height = H;
+  const ctx = cvs.getContext('2d');
   const col = catColor(S.activeCategory);
+  ctx.fillStyle = col + 'CC';  // ~80% alpha
   for (const flat of polys) {
-    const pts = flat.map(v => v * displayScale);
-    editLayer.add(new Konva.Line({
-      points: pts, stroke: col, strokeWidth: 2,
-      closed: true, fill: col + '80',
-    }));
+    if (flat.length < 6) continue;  // need ≥3 points
+    ctx.beginPath();
+    for (let i = 0; i < flat.length; i += 2) {
+      const x = flat[i], y = flat[i + 1];
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.fill();
   }
+  editLayer.add(new Konva.Image({
+    image: cvs,
+    width: stage.width(),
+    height: stage.height(),
+  }));
   editLayer.batchDraw();
-  setStatus(`loaded ${polys.length} GT polygons for ${S.activeCategory}. Brush/eraser to refine, then Commit.`);
+  // Hide the GT outline for this category so it doesn't look un-erasable
+  S.editingGT.add(S.activeCategory);
+  renderOverlays();
+  setStatus(`loaded ${polys.length} GT polygon(s) for ${S.activeCategory} as raster — brush/eraser fully editable. Commit when done.`);
+}
+
+// ---------- Undo / Redo ----------
+async function undoAction() {
+  // Unified undo: stroke-level first (covers brush AND eraser strokes on edit layer),
+  // then backend mask-state undo (delete/commit/clear/propagate).
+  if (S.undoStack && S.undoStack.length > 0) {
+    undo();
+    setStatus(`undo stroke · ${S.undoStack.length} stroke(s) remaining`);
+    return;
+  }
+  if (!S.snippet) return;
+  try {
+    const r = await apiPost('/api/undo', {});
+    setStatus(`undo: ${r.description} · ${r.restored} mask(s) restored · ${r.undo_remaining} undo / ${r.redo_available} redo`);
+    await refreshAfterMaskChange(S.frameIdx);
+  } catch (e) {
+    setStatus(`undo: ${e.message}`);
+  }
+}
+
+async function redoAction() {
+  if (!S.snippet) return;
+  try {
+    const r = await apiPost('/api/redo', {});
+    setStatus(`redo: ${r.description} · ${r.restored} mask(s) reapplied · ${r.undo_available} undo / ${r.redo_remaining} redo`);
+    await refreshAfterMaskChange(S.frameIdx);
+  } catch (e) {
+    setStatus(`redo: ${e.message}`);
+  }
+}
+
+// ---------- Master mask list ----------
+let _masksItemsCache = [];
+
+async function refreshMasksList() {
+  if (!S.snippet) return;
+  try {
+    const r = await apiGet('/api/masks/list');
+    _masksItemsCache = r.items || [];
+    renderMasksList();  // sets counter based on current filter scope
+  } catch (e) {
+    setStatus(`mask-list refresh failed: ${e.message}`);
+  }
+}
+
+function renderMasksList() {
+  const list = $('#masks-list');
+  list.innerHTML = '';
+  const showGt = $('#filter-gt')?.checked ?? true;
+  const showAp = $('#filter-approved')?.checked ?? true;
+  const showPr = $('#filter-propagated')?.checked ?? true;
+  const currOnly = $('#filter-current')?.checked ?? true;
+  const q = ($('#masks-search')?.value || '').trim().toLowerCase();
+
+  const filtered = _masksItemsCache.filter(it => {
+    if (currOnly && it.frame_idx !== S.frameIdx) return false;
+    if (it.kind === 'gt' && !showGt) return false;
+    if (it.kind === 'approved' && !showAp) return false;
+    if (it.kind === 'propagated' && !showPr) return false;
+    if (q && !it.category.toLowerCase().includes(q)) return false;
+    return true;
+  });
+
+  // Update counter to reflect filter scope
+  const fcounts = { gt: 0, approved: 0, propagated: 0 };
+  for (const it of filtered) fcounts[it.kind] = (fcounts[it.kind] || 0) + 1;
+  const scopeLabel = currOnly ? `frame ${S.frameIdx}` : 'all';
+  $('#masks-counts').textContent =
+    `[${scopeLabel}] GT:${fcounts.gt} A:${fcounts.approved} P:${fcounts.propagated}`;
+
+  if (filtered.length === 0) {
+    list.innerHTML = '<div style="padding:6px; color:var(--text-dim);">no masks match filter</div>';
+    return;
+  }
+
+  // Cap render to avoid DOM overload (~960 GT rows on E_3 snippets)
+  const CAP = 500;
+  const shown = filtered.slice(0, CAP);
+
+  for (const it of shown) {
+    const row = document.createElement('div');
+    const col = catColor(it.category);
+    const isCurr = it.frame_idx === S.frameIdx;
+    row.style.cssText = `padding:3px 6px; cursor:pointer; border-bottom:1px solid var(--border); ${isCurr ? 'background:var(--panel-2);' : ''}`;
+    const kindMark = it.kind === 'approved' ? '●' : it.kind === 'propagated' ? '○' : '◆';
+    const kindColor = it.kind === 'approved' ? 'var(--text)'
+                    : it.kind === 'gt' ? '#ffd60a'
+                    : 'var(--text-dim)';
+    const fnum = it.frame_num !== null && it.frame_num !== undefined ? ` #${it.frame_num}` : '';
+    const px = it.kind === 'gt' ? `${it.pixels}pt` : `${it.pixels}px`;
+    row.innerHTML = `
+      <span style="display:inline-block;width:8px;height:8px;background:${col};border-radius:2px;margin-right:5px"></span>
+      <span style="color:${kindColor}">${kindMark}</span>
+      f${it.frame_idx}${fnum} · ${it.category} · ${px}
+    `;
+    row.title = `${it.kind} · frame_idx ${it.frame_idx} · ${it.category}`;
+    row.onmouseover = () => row.style.background = 'var(--accent-glow)';
+    row.onmouseout = () => row.style.background = isCurr ? 'var(--accent-glow)' : '';
+    row.onclick = () => loadFrame(it.frame_idx);
+    row.oncontextmenu = (e) => showMaskContextMenu(e, it);
+    list.appendChild(row);
+  }
+  if (filtered.length > CAP) {
+    const more = document.createElement('div');
+    more.style.cssText = 'padding:6px; color:var(--text-dim); text-align:center;';
+    more.textContent = `…${filtered.length - CAP} more (use category filter to narrow)`;
+    list.appendChild(more);
+  }
+}
+
+// ---------- Context menu ----------
+function hideContextMenu() {
+  document.querySelectorAll('.ctx-menu').forEach(el => el.remove());
+}
+
+function showMaskContextMenu(e, item) {
+  e.preventDefault();
+  e.stopPropagation();
+  hideContextMenu();
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  menu.style.left = e.clientX + 'px';
+  menu.style.top = e.clientY + 'px';
+
+  const header = document.createElement('div');
+  header.className = 'ctx-header';
+  header.textContent = `${item.kind} · ${item.category} · f${item.frame_idx}`;
+  menu.appendChild(header);
+
+  const sep = document.createElement('div');
+  sep.className = 'ctx-divider';
+  menu.appendChild(sep);
+
+  const addItem = (label, fn, danger = false) => {
+    const it = document.createElement('div');
+    it.className = 'ctx-item' + (danger ? ' danger' : '');
+    it.textContent = label;
+    it.onclick = (ev) => { ev.stopPropagation(); hideContextMenu(); fn(); };
+    menu.appendChild(it);
+  };
+
+  addItem(`Jump to frame ${item.frame_idx}`, () => loadFrame(item.frame_idx));
+
+  if (item.kind === 'gt') {
+    addItem('Load as editable here', () => {
+      loadFrame(item.frame_idx).then(() => {
+        S.activeCategory = item.category;
+        const acDd = $('#active-cat'); if (acDd) acDd.value = item.category;
+        renderCategoryList();
+        loadGTEditable();
+      });
+    });
+    addItem('GT is read-only', () => {}, true);
+  } else {
+    addItem(`Delete this ${item.kind} mask`, () => deleteMask(item), true);
+    addItem(`Delete all ${item.kind} on frame ${item.frame_idx}`,
+            () => clearMasks({ kind: item.kind, frame_idx: item.frame_idx }), true);
+    addItem(`Delete all ${item.kind} for ${item.category}`,
+            () => clearMasks({ kind: item.kind, category: item.category }), true);
+  }
+
+  document.body.appendChild(menu);
+  // Close on next outside click / Escape
+  setTimeout(() => {
+    document.addEventListener('click', hideContextMenu, { once: true });
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape') hideContextMenu();
+    }, { once: true });
+  }, 0);
+}
+
+async function deleteMask(item) {
+  try {
+    await apiPost('/api/masks/delete', {
+      frame_idx: item.frame_idx,
+      category: item.category,
+      kind: item.kind,
+    });
+    setStatus(`deleted ${item.kind} ${item.category} @ f${item.frame_idx}`);
+    await refreshAfterMaskChange(item.frame_idx);
+  } catch (e) {
+    setStatus(`delete failed: ${e.message}`);
+  }
+}
+
+async function clearMasks(opts) {
+  const sure = confirm(
+    `Delete ${opts.kind || 'all'} masks` +
+    (opts.category ? ` for ${opts.category}` : '') +
+    (opts.frame_idx !== undefined ? ` on frame ${opts.frame_idx}` : ' across all frames') +
+    '?'
+  );
+  if (!sure) return;
+  try {
+    const r = await apiPost('/api/masks/clear', opts);
+    setStatus(`deleted ${r.deleted} mask(s)`);
+    await refreshAfterMaskChange(S.frameIdx);
+  } catch (e) {
+    setStatus(`clear failed: ${e.message}`);
+  }
+}
+
+async function refreshAfterMaskChange(fidx) {
+  await refreshMasksList();
+  // Re-pull current frame masks
+  try {
+    const m = await apiGet(`/api/masks/${S.frameIdx}`);
+    S.approved = m.approved || {};
+    S.propagated = m.propagated || {};
+    renderOverlays();
+  } catch (_) {}
 }
 
 // ---------- UI binding ----------
@@ -591,6 +1018,7 @@ async function loadSnippet() {
     initKonva(S.width, S.height);
     renderCategoryList();
     await loadFrame(0);
+    refreshMasksList();
     setStatus(`loaded ${r.episode}/${r.snippet_id} · ${r.n_frames} frames · restored ${r.restored_anchors} anchors`);
   } catch (e) {
     setStatus(`load failed: ${e.message}`);
@@ -627,9 +1055,19 @@ function bindEvents() {
       promptLayer.destroyChildren();
       S.samPoints = []; S.samBox = null; S.samBoxFirstClick = null;
       promptLayer.batchDraw();
+      // Show/hide text prompt panel
+      $('#text-prompt-group').style.display = (S.activeTool === 'sam-text') ? '' : 'none';
       setStatus(`tool: ${S.activeTool}`);
     };
   });
+
+  $('#text-conf').oninput = (e) => {
+    $('#text-conf-val').textContent = parseFloat(e.target.value).toFixed(2);
+  };
+  $('#text-run-btn').onclick = runTextPrompt;
+  $('#text-accept-btn').onclick = acceptSelectedTextDets;
+  $('#text-select-all').onclick = () => selectAllText(true);
+  $('#text-select-none').onclick = () => selectAllText(false);
 
   $('#brush-size').oninput = (e) => {
     S.brushSize = parseInt(e.target.value);
@@ -646,12 +1084,23 @@ function bindEvents() {
     S.samPoints = []; S.samBox = null; S.samBoxFirstClick = null;
     promptLayer.batchDraw();
     S.undoStack = [];
+    S.editingGT.clear();
+    renderOverlays();
     setStatus('edit layer cleared');
   };
   $('#load-gt-btn').onclick = loadGTEditable;
 
   $('#prop-btn').onclick = propagate;
   $('#export-btn').onclick = exportSnippet;
+  $('#masks-refresh').onclick = refreshMasksList;
+  ['#filter-gt', '#filter-approved', '#filter-propagated', '#filter-current'].forEach(sel => {
+    $(sel).onchange = renderMasksList;
+  });
+  $('#masks-search').oninput = renderMasksList;
+  $('#clear-prop-btn').onclick = () => clearMasks({ kind: 'propagated' });
+  $('#clear-app-btn').onclick = () => clearMasks({ kind: 'approved' });
+  $('#undo-btn').onclick = undoAction;
+  $('#redo-btn').onclick = redoAction;
 
   $('#show-gt').onchange = e => { S.showGt = e.target.checked; renderOverlays(); };
   $('#show-approved').onchange = e => { S.showApproved = e.target.checked; renderOverlays(); };
@@ -664,9 +1113,13 @@ function bindEvents() {
     else if (e.key === 'e') selectTool('eraser');
     else if (e.key === 's' && !e.shiftKey) selectTool('sam-click');
     else if (e.key === 'S' && e.shiftKey) selectTool('sam-box');
+    else if (e.key === 't') selectTool('sam-text');
     else if (e.key === 'g') loadGTEditable();
     else if (e.key === 'Enter') { e.preventDefault(); commitAnchor(); }
     else if (e.key === ' ') { e.preventDefault(); propagate(); }
+    else if (e.key === 'z' && (e.ctrlKey || e.metaKey) && e.shiftKey) { e.preventDefault(); undoAction(); }
+    else if (e.key === 'Z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); undoAction(); }
+    else if (e.key === 'y' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); redoAction(); }
     else if (e.key === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); undo(); }
     else if (e.key === '[') { $('#brush-size').value = Math.max(1, S.brushSize - 2); $('#brush-size').dispatchEvent(new Event('input')); }
     else if (e.key === ']') { $('#brush-size').value = Math.min(80, S.brushSize + 2); $('#brush-size').dispatchEvent(new Event('input')); }
@@ -696,10 +1149,45 @@ function startWS() {
   }
 }
 
+// ---------- Health indicator ----------
+async function refreshHealth() {
+  try {
+    const r = await apiGet('/api/health');
+    const el = $('#app-health');
+    if (!el) return;
+    const ver = $('#app-version');
+    if (ver && r.version) ver.textContent = `v${r.version}`;
+
+    let cls = 'ok', glyph = '●', txt;
+    if (r.no_model) { cls = 'warn'; txt = 'no-model'; }
+    else if (!r.cuda_available) { cls = 'warn'; txt = 'cpu'; }
+    else if (r.gpu && r.gpu.vram_pct_used > 90) {
+      cls = 'err';
+      txt = `${r.gpu.vram_pct_used.toFixed(0)}% vram · ${r.gpu.name}`;
+    } else if (r.gpu) {
+      txt = `${r.gpu.name.replace('NVIDIA ', '')} · ${r.gpu.vram_free_mb}/${r.gpu.vram_total_mb}MB`;
+    } else {
+      cls = 'warn'; txt = 'no gpu info';
+    }
+    el.innerHTML = `<span class="indicator ${cls}">${glyph}</span> ${txt}`;
+  } catch (e) {
+    const el = $('#app-health');
+    if (el) el.innerHTML = `<span class="indicator err">●</span> health unreachable`;
+  }
+}
+
 // ---------- Boot ----------
 (async () => {
   bindEvents();
   await refreshEpisodes();
   startWS();
+  refreshHealth();
+  setInterval(refreshHealth, 10000);
+  // Viewport resize → re-fit Konva stage
+  window.addEventListener('resize', handleResize);
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(handleResize);
+    ro.observe(document.getElementById('canvas-wrap'));
+  }
   setStatus('select episode + snippet, then Load Snippet.');
 })();

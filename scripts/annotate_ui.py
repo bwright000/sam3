@@ -546,7 +546,7 @@ def preview_mask(frame_idx, category):
 
         preview_mask_np = None
         for fidx, obj_ids, _, video_res_masks, obj_scores in tracker.propagate_in_video(
-            state, start_frame_idx=frame_idx, max_frame_num_to_track=0
+            state, start_frame_idx=frame_idx, max_frame_num_to_track=0, reverse=False
         ):
             for i, oid in enumerate(obj_ids):
                 if int(oid) == obj_id:
@@ -623,21 +623,37 @@ def undo_last_point(category, frame_idx):
     return render_frame(int(frame_idx)), f"Undid point at ({removed[0]}, {removed[1]}) for {category}. {len(pts)} remaining."
 
 
-def clear_points(category):
-    """Clear all points and box for a category."""
+def clear_points(category, frame_idx=None):
+    """Clear points, box, AND preview mask for a category at the current frame."""
     g_state["points"][category] = []
     g_state["boxes"][category] = None
     g_state["box_first_click"] = None
-    return "Points and box cleared"
+    cleared_preview = False
+    if frame_idx is not None:
+        fidx = int(frame_idx)
+        if fidx in g_state["preview_masks"] and category in g_state["preview_masks"][fidx]:
+            g_state["preview_masks"][fidx].pop(category, None)
+            if not g_state["preview_masks"][fidx]:
+                del g_state["preview_masks"][fidx]
+            cleared_preview = True
+    extra = " + preview" if cleared_preview else ""
+    return f"Points and box cleared{extra}"
 
 
-def clear_all_points():
-    """Clear points and boxes for all categories."""
+def clear_all_points(frame_idx=None):
+    """Clear points/boxes for all categories AND all preview masks at the current frame."""
     for cat in g_state["categories"]:
         g_state["points"][cat] = []
         g_state["boxes"][cat] = None
     g_state["box_first_click"] = None
-    return "All points and boxes cleared"
+    cleared_count = 0
+    if frame_idx is not None:
+        fidx = int(frame_idx)
+        if fidx in g_state["preview_masks"]:
+            cleared_count = len(g_state["preview_masks"][fidx])
+            del g_state["preview_masks"][fidx]
+    extra = f" + {cleared_count} previews at this frame" if cleared_count else ""
+    return f"All points and boxes cleared{extra}"
 
 
 def add_category(name):
@@ -1115,6 +1131,92 @@ def approve_all_previews():
     return f"Approved {count} preview masks" if count else "No preview masks to approve"
 
 
+def load_existing_tool_previews():
+    """Load tool masks from a prior run's snippet_NNN_results.json as previews.
+
+    Used to review previous SAM3 text-prompt tool outputs and either approve
+    them as-is or re-click to fix broken ones. Masks land in preview_masks
+    under any category whose name (case-insensitive) matches a key in
+    results.frames[*].masks (e.g. 'tool' -> 'Tool').
+    """
+    snip_dir = g_state["snippet_dir"]
+    if snip_dir is None:
+        return "No snippet loaded"
+
+    snip_id = g_state["snippet_id"]
+    results_path = snip_dir / f"snippet_{snip_id}_results.json"
+    if not results_path.exists():
+        return f"No existing results file: {results_path.name}"
+
+    try:
+        with open(results_path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return f"Failed to read {results_path.name}: {e}"
+
+    frames_list = data.get("frames", []) if isinstance(data, dict) else data
+    if not frames_list:
+        return "Results file has no frames"
+
+    # Build lookup: file_name -> frame index
+    file_to_idx = {p.name: i for i, p in enumerate(g_state["frame_files"])}
+    # Build case-insensitive category map (lowercased mask key -> category name)
+    lower_to_cat = {c.lower(): c for c in g_state["categories"]}
+
+    h, w = g_state["video_height"], g_state["video_width"]
+    loaded = 0
+    skipped_no_match = 0
+    frames_touched = set()
+    unknown_mask_keys = set()
+
+    for entry in frames_list:
+        fname = entry.get("file") or (entry.get("frame", "") + ".webp")
+        fidx = file_to_idx.get(fname)
+        if fidx is None:
+            # Try without extension suffix swap
+            stem = Path(fname).stem
+            for cand in (stem + ".webp", stem + ".jpg", stem + ".png"):
+                if cand in file_to_idx:
+                    fidx = file_to_idx[cand]
+                    break
+        if fidx is None:
+            skipped_no_match += 1
+            continue
+
+        masks_dict = entry.get("masks", {})
+        for mask_key, mask_entries in masks_dict.items():
+            cat = lower_to_cat.get(mask_key.lower())
+            if cat is None:
+                unknown_mask_keys.add(mask_key)
+                continue
+            # Skip if already approved
+            if fidx in g_state["approved_masks"] and cat in g_state["approved_masks"][fidx]:
+                continue
+
+            mask = np.zeros((h, w), dtype=np.uint8)
+            for m in mask_entries:
+                for poly in m.get("segmentation", []):
+                    pts = np.array(poly, dtype=np.int32).reshape(-1, 2)
+                    cv2.fillPoly(mask, [pts], 1)
+            if mask.sum() == 0:
+                continue
+
+            if fidx not in g_state["preview_masks"]:
+                g_state["preview_masks"][fidx] = {}
+            g_state["preview_masks"][fidx][cat] = mask
+            frames_touched.add(fidx)
+            loaded += 1
+
+    msg = (f"Loaded {loaded} existing masks as previews across {len(frames_touched)} frames "
+           f"from {results_path.name}.")
+    if skipped_no_match:
+        msg += f" Skipped {skipped_no_match} frames (no file match)."
+    if unknown_mask_keys:
+        msg += f" Ignored keys not in categories: {sorted(unknown_mask_keys)}."
+    msg += " Use GT> to navigate frames and Approve Mask per frame, or Approve All Previews to accept all."
+    return msg
+
+
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
@@ -1246,7 +1348,21 @@ def build_ui(args, episodes=None):
         with gr.Accordion("Ground Truth", open=False):
             with gr.Row():
                 load_all_gt_btn = gr.Button("Load All GT as Previews")
+                load_existing_btn = gr.Button("Load Existing Tool Masks")
                 approve_all_btn = gr.Button("Approve All Previews", variant="primary")
+
+        # --- Accordion: Draw Mask (manual paint) ---
+        with gr.Accordion("Draw Mask (paint)", open=False):
+            paint_editor = gr.ImageEditor(
+                label="Paint tool mask (brush = add, eraser = remove). Click 'Sync to Current Frame' first.",
+                type="numpy",
+                height=500,
+                transforms=(),
+                sources=(),
+            )
+            with gr.Row():
+                paint_sync_btn = gr.Button("Sync to Current Frame")
+                paint_save_btn = gr.Button("Save Drawn Mask as Approved", variant="primary")
 
         # --- Accordion: Propagate & Export ---
         with gr.Accordion("Propagate & Export", open=True):
@@ -1355,11 +1471,11 @@ def build_ui(args, episodes=None):
             return undo_last_point(category, frame_idx)
 
         def on_clear(category, frame_idx):
-            msg = clear_points(category)
+            msg = clear_points(category, frame_idx)
             return render_frame(int(frame_idx)), msg
 
         def on_clear_all(frame_idx):
-            msg = clear_all_points()
+            msg = clear_all_points(frame_idx)
             return render_frame(int(frame_idx)), msg
 
         def on_propagate(conf_threshold):
@@ -1378,6 +1494,68 @@ def build_ui(args, episodes=None):
         def on_load_all_gt(frame_idx):
             msg = load_all_gt_previews()
             return render_frame(int(frame_idx)), msg
+
+        def on_load_existing(frame_idx):
+            msg = load_existing_tool_previews()
+            return render_frame(int(frame_idx)), msg
+
+        def on_paint_sync(frame_idx):
+            fidx = int(frame_idx)
+            if fidx >= len(g_state["frame_images"]):
+                return gr.update()
+            img = g_state["frame_images"][fidx]
+            return gr.update(value=img)
+
+        def on_paint_save(editor_value, category, frame_idx):
+            if editor_value is None:
+                return render_frame(int(frame_idx)), "Draw a mask first (brush tool)."
+            # Gradio returns EditorValue: {'background': ndarray, 'layers': [...], 'composite': ndarray}
+            composite = editor_value.get("composite") if isinstance(editor_value, dict) else None
+            background = editor_value.get("background") if isinstance(editor_value, dict) else None
+            layers = editor_value.get("layers", []) if isinstance(editor_value, dict) else []
+            if composite is None:
+                return render_frame(int(frame_idx)), "Editor returned no image"
+
+            comp = np.asarray(composite)
+            bg = np.asarray(background) if background is not None else None
+
+            # Build mask: prefer layer alpha if present; else diff composite from background
+            h, w = g_state["video_height"], g_state["video_width"]
+            mask = np.zeros((h, w), dtype=np.uint8)
+            used_layer = False
+            for layer in layers:
+                arr = np.asarray(layer)
+                if arr.ndim != 3:
+                    continue
+                if arr.shape[2] == 4:
+                    alpha = arr[:, :, 3]
+                else:
+                    alpha = arr.any(axis=-1).astype(np.uint8) * 255
+                if alpha.shape != (h, w):
+                    alpha = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_NEAREST)
+                mask |= (alpha > 0).astype(np.uint8)
+                used_layer = True
+
+            if not used_layer and bg is not None and comp.shape == bg.shape:
+                diff = np.any(comp != bg, axis=-1).astype(np.uint8)
+                if diff.shape != (h, w):
+                    diff = cv2.resize(diff, (w, h), interpolation=cv2.INTER_NEAREST)
+                mask = diff
+
+            if mask.sum() == 0:
+                return render_frame(int(frame_idx)), "Drawn mask was empty (nothing painted)."
+
+            fidx = int(frame_idx)
+            if fidx not in g_state["approved_masks"]:
+                g_state["approved_masks"][fidx] = {}
+            g_state["approved_masks"][fidx][category] = mask
+            # Clear any preview for this cat at this frame
+            if fidx in g_state["preview_masks"] and category in g_state["preview_masks"][fidx]:
+                g_state["preview_masks"][fidx].pop(category, None)
+                if not g_state["preview_masks"][fidx]:
+                    del g_state["preview_masks"][fidx]
+            _autosave()
+            return render_frame(fidx), f"Saved drawn {category} mask ({int(mask.sum())}px) as approved at frame {fidx}"
 
         def on_approve_all(frame_idx):
             msg = approve_all_previews()
@@ -1421,6 +1599,9 @@ def build_ui(args, episodes=None):
         clear_all_btn.click(on_clear_all, [frame_slider], [frame_display, status_box])
         load_gt_btn.click(on_load_gt, [frame_slider], [frame_display, status_box])
         load_all_gt_btn.click(on_load_all_gt, [frame_slider], [frame_display, status_box])
+        load_existing_btn.click(on_load_existing, [frame_slider], [frame_display, status_box])
+        paint_sync_btn.click(on_paint_sync, [frame_slider], [paint_editor])
+        paint_save_btn.click(on_paint_save, [paint_editor, category_dd, frame_slider], [frame_display, status_box])
         approve_all_btn.click(on_approve_all, [frame_slider], [frame_display, status_box])
         propagate_btn.click(on_propagate, [conf_slider], [status_box])
         jump_low_btn.click(on_jump_low, [frame_slider], [frame_slider, category_dd, status_box])

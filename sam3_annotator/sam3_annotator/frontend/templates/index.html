@@ -3,10 +3,19 @@
 <head>
   <meta charset="UTF-8">
   <title>SAM3 Annotator</title>
-  <link rel="stylesheet" href="/static/css/app.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IM+Fell+English:wght@400;700&family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/app.css?v=0.1.0-fitvp">
   <script src="https://unpkg.com/konva@9/konva.min.js"></script>
 </head>
 <body>
+  <h1 class="app-title">
+    <span class="gear">⚙</span>
+    SAM3 Annotator
+    <span class="version" id="app-version">v0.1.0</span>
+    <span class="version" id="app-health" style="margin-left:8px;"></span>
+  </h1>
   <div id="app">
     <!-- Sidebar: episode / snippet picker + categories -->
     <aside id="sidebar">
@@ -36,6 +45,29 @@
           <input id="prop-n" type="number" value="120" min="1" max="600" style="width:60px">
         </div>
         <button id="prop-btn" class="btn primary full">Propagate</button>
+      </div>
+      <div class="block">
+        <div class="label">Frame Masks <span id="masks-counts" style="float:right; color:var(--text-dim);"></span></div>
+        <div class="row" style="gap:4px; flex-wrap:wrap;">
+          <label class="row" style="gap:3px;font-size:11px;"><input type="checkbox" id="filter-current" checked> Current frame only</label>
+        </div>
+        <div class="row" style="gap:4px; flex-wrap:wrap;">
+          <label class="row" style="gap:3px;font-size:11px;"><input type="checkbox" id="filter-gt" checked> GT</label>
+          <label class="row" style="gap:3px;font-size:11px;"><input type="checkbox" id="filter-approved" checked> Approved</label>
+          <label class="row" style="gap:3px;font-size:11px;"><input type="checkbox" id="filter-propagated" checked> Propagated</label>
+        </div>
+        <input id="masks-search" type="text" placeholder="filter by category…" style="font-size:11px;">
+        <div class="row">
+          <button id="undo-btn" class="btn small" title="Undo last delete/commit/clear/propagate (Ctrl+Shift+Z)">↶ Undo</button>
+          <button id="redo-btn" class="btn small" title="Redo (Ctrl+Y)">Redo ↷</button>
+          <button id="masks-refresh" class="btn small">Refresh</button>
+        </div>
+        <div class="row">
+          <button id="clear-prop-btn" class="btn small" title="Clear all propagated masks (keeps approved + GT)">Clear Propagated</button>
+          <button id="clear-app-btn" class="btn small" style="color:var(--warm)" title="Clear all approved masks">Clear Approved</button>
+        </div>
+        <div id="masks-list" style="font-size:11px; max-height:240px; overflow-y:auto; border:1px solid var(--border); border-radius:3px; padding:2px;"></div>
+        <div style="font-size:10px; color:var(--text-muted);">Right-click a row for actions</div>
       </div>
       <div class="block">
         <button id="export-btn" class="btn accent full">Export Snippet</button>
@@ -68,6 +100,23 @@
         <button data-tool="eraser" class="tool-btn" title="Eraser (E)">🧽<br>Eraser</button>
         <button data-tool="sam-click" class="tool-btn" title="SAM3 Click (S)">🎯<br>SAM Click</button>
         <button data-tool="sam-box" class="tool-btn" title="SAM3 Box (Shift+S)">📦<br>SAM Box</button>
+        <button data-tool="sam-text" class="tool-btn" title="SAM3 Text (T)">🔤<br>SAM Text</button>
+      </div>
+      <div class="tool-group" id="text-prompt-group" style="display:none">
+        <div class="label">Text Prompt</div>
+        <input id="text-prompt" type="text" placeholder="e.g. surgical instrument">
+        <div class="row">
+          <label>Conf ≥</label>
+          <input id="text-conf" type="range" min="0.05" max="0.9" step="0.05" value="0.3">
+          <span id="text-conf-val">0.30</span>
+        </div>
+        <button id="text-run-btn" class="btn primary full">Run Text Prompt</button>
+        <div id="text-results" style="font-size:11px; color:var(--text-dim); max-height:200px; overflow-y:auto; border-radius:4px;"></div>
+        <div class="row">
+          <button id="text-select-all" class="btn small">All</button>
+          <button id="text-select-none" class="btn small">None</button>
+          <button id="text-accept-btn" class="btn primary full">Accept Selected</button>
+        </div>
       </div>
       <div class="tool-group">
         <div class="label">Brush Size</div>
@@ -100,6 +149,6 @@
     </aside>
   </div>
 
-  <script src="/static/js/app.js"></script>
+  <script src="/static/js/app.js?v=0.1.0-fitvp"></script>
 </body>
 </html>

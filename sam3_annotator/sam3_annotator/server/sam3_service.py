@@ -19,8 +19,9 @@ from .storage import SnippetInfo
 
 
 class SAM3Service:
-    def __init__(self, no_model: bool = False):
+    def __init__(self, no_model: bool = False, enable_text: bool = True):
         self.no_model = no_model
+        self.enable_text = enable_text
         self.predictor = None
         self.tracker = None
         self._state = None
@@ -29,6 +30,9 @@ class SAM3Service:
         self._lock = threading.Lock()
         # obj_id assignment per category for current snippet
         self._cat_to_objid: dict[str, int] = {}
+        # Lazy-loaded image-level model for text prompting (separate from tracker)
+        self._image_model = None
+        self._image_processor = None
 
     # -------- lifecycle --------
 
@@ -207,3 +211,87 @@ class SAM3Service:
     @property
     def objid_to_cat(self) -> dict[int, str]:
         return {v: k for k, v in self._cat_to_objid.items()}
+
+    # -------- text prompting (separate image model) --------
+
+    def ensure_image_model(self) -> None:
+        if self.no_model or not self.enable_text:
+            return
+        if self._image_processor is not None:
+            return
+        from sam3.model_builder import build_sam3_image_model
+        from sam3.model.sam3_image_processor import Sam3Processor
+        t0 = time.time()
+        print("[sam3_service] loading image model for text prompting...")
+        self._image_model = build_sam3_image_model()
+        self._image_processor = Sam3Processor(self._image_model)
+        print(f"[sam3_service] image model loaded in {time.time()-t0:.1f}s")
+
+    def text_preview(self, frame_idx: int, text: str,
+                     conf_threshold: float = 0.3) -> list[dict]:
+        """Run SAM3 image-level text-prompt detection on a single frame.
+
+        Returns list of detections sorted by descending score:
+            [{mask: (H,W) uint8, box: [x1,y1,x2,y2], score: float}, ...]
+        """
+        if self.no_model:
+            return []
+        if not self.enable_text:
+            raise RuntimeError("text prompting disabled (--no-text)")
+        self.ensure_image_model()
+        if self._snippet is None:
+            raise RuntimeError("no snippet open")
+
+        from PIL import Image
+        fpath = self._snippet.frame_files[frame_idx]
+        img = Image.open(fpath).convert("RGB")
+
+        state = self._image_processor.set_image(img)
+        self._image_processor.set_confidence_threshold(conf_threshold, state)
+        state = self._image_processor.set_text_prompt(text, state)
+
+        # State now has 'masks', 'boxes', 'scores'
+        masks = state.get("masks")
+        boxes = state.get("boxes")
+        scores = state.get("scores")
+
+        results: list[dict] = []
+        if masks is None or boxes is None or scores is None:
+            return results
+
+        # Coerce to numpy
+        if isinstance(masks, torch.Tensor):
+            masks_np = masks.detach().cpu().numpy()
+        else:
+            masks_np = np.asarray(masks)
+        if isinstance(boxes, torch.Tensor):
+            boxes_np = boxes.detach().cpu().numpy()
+        else:
+            boxes_np = np.asarray(boxes)
+        if isinstance(scores, torch.Tensor):
+            scores_np = scores.detach().cpu().numpy()
+        else:
+            scores_np = np.asarray(scores)
+
+        # masks shape: (N, H, W) or (N, 1, H, W) — squeeze
+        if masks_np.ndim == 4:
+            masks_np = masks_np[:, 0]
+        # boxes shape: (N, 4) — assume xyxy in pixel coords; some APIs return cxcywh normalized.
+        # Sam3Processor returns xyxy in image pixel coords per its docs.
+
+        H, W = self._snippet.height, self._snippet.width
+        for i in range(masks_np.shape[0]):
+            m = (masks_np[i] > 0).astype(np.uint8)
+            if m.shape != (H, W):
+                import cv2
+                m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+            score = float(scores_np[i]) if i < len(scores_np) else 0.0
+            box = boxes_np[i].tolist() if i < len(boxes_np) else [0, 0, 0, 0]
+            results.append({
+                "mask": m,
+                "box": [float(b) for b in box],
+                "score": score,
+            })
+
+        results.sort(key=lambda r: -r["score"])
+        return results

@@ -8,6 +8,17 @@ version = "0.1.0"
 description = "Photoshop-style paint annotator for SAM3 video mask seeding"
 readme = "README.md"
 requires-python = ">=3.10"
+license = { file = "LICENSE" }
+keywords = ["sam3", "annotation", "segmentation", "video", "surgical"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
@@ -19,6 +30,9 @@ dependencies = [
     "python-multipart>=0.0.9",
     "scikit-image>=0.22",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
 
 [project.scripts]
 sam3-annotator = "sam3_annotator.server.__main__:main"
