@@ -1,0 +1,15 @@
+{
+  "_doc": "Expected number of tools per frame for each snippet, used by batch_text_propagate.py to score detection quality. 'variable' snippets accept any of the listed counts.",
+  "E_3/001": 2,
+  "E_3/002": 2,
+  "E_3/003": 1,
+  "E_3/004": 1,
+  "E_3/005": null,
+  "F_3/001": 2,
+  "F_3/002": null,
+  "F_3/003": 2,
+  "F_3/004": null,
+  "F_3/005": 2,
+  "F_3/006": null,
+  "F_3/007": 2
+}
