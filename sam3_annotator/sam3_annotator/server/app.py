@@ -309,6 +309,13 @@ async def startup():
         except Exception as e:
             logger.exception("model load failed at startup; will retry on first request")
             # Don't crash the server — let /api/health surface the error
+        # Eager-load the image model too if text prompting is enabled.
+        # Avoids a slow first text request (which often 504s through tunnels).
+        if not NO_TEXT:
+            try:
+                STATE.sam3.ensure_image_model()
+            except Exception:
+                logger.exception("image model load failed at startup; text prompts will retry on demand")
 
 
 # ---------- Session + metadata ----------

@@ -20,10 +20,13 @@ import cv2
 import numpy as np
 
 
-def preprocess_painted_mask(mask: np.ndarray) -> np.ndarray:
+def preprocess_painted_mask(mask: np.ndarray, min_component_area: int = 100) -> np.ndarray:
     """Clean a brush-painted binary mask for SAM3 consumption.
 
     mask: (H, W) uint8 with 0/1 values.
+    min_component_area: drop connected components smaller than this many pixels
+        (default 100 — kills mouse-jitter dabs but preserves multi-instrument
+        masks where the user paints two or more separate tools).
     Returns: (H, W) uint8 cleaned mask.
     """
     if mask.dtype != np.uint8:
@@ -35,17 +38,17 @@ def preprocess_painted_mask(mask: np.ndarray) -> np.ndarray:
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-    # 2. Largest connected component (drop stray dabs)
+    # 2. Drop only TINY components (stray dabs). Keep everything else so users
+    # can paint multiple disjoint instruments under a single category.
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
     if n_labels <= 1:
         return closed
-    # label 0 is background
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    if areas.size == 0:
-        return closed
-    largest = int(np.argmax(areas)) + 1
-    keep = (labels == largest).astype(np.uint8)
-    return keep
+
+    keep = np.zeros_like(closed)
+    for i in range(1, n_labels):  # skip label 0 (background)
+        if stats[i, cv2.CC_STAT_AREA] >= min_component_area:
+            keep[labels == i] = 1
+    return keep if keep.sum() > 0 else closed  # fallback: keep everything if all CCs were tiny
 
 
 def inpaint_specular_highlights(frame_rgb: np.ndarray, v_threshold: int = 245,

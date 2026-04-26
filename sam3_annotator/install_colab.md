@@ -73,9 +73,11 @@ cd sam3
 
 ### B3 — Install
 ```bash
-pip install -q -e ./sam3
-pip install -q -e ./sam3_annotator
+# Use absolute paths to avoid cwd confusion
+pip install -q -e /content/sam3/sam3
+pip install -q -e /content/sam3/sam3_annotator
 ```
+(numpy<2 dependency warnings about jax/cupy/rasterio etc. are safe to ignore — we don't use those packages.)
 
 ### B4 — HuggingFace auth (only first session — token persists in cached dir)
 ```bash
