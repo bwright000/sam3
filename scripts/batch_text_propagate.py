@@ -221,35 +221,42 @@ def process_snippet(predictor, snip_dir: Path, prompt: str = "tool",
     print(f"  {n} frames, split_size={split_size}, "
           f"keyframes_local={keyframes[:5]}{'...' if len(keyframes)>5 else ''}")
 
+    import torch
     t0 = time.time()
     session = predictor.start_session(resource_path=str(frames_dir))
     sid = session["session_id"]
     per_frame: dict[int, dict] = {}
 
-    try:
-        # Text prompt is global — one call sets it for all frames.
-        # frame_idx is just where to anchor the initial inference.
-        anchor = keyframes[0]
-        print(f"  add_prompt text='{prompt}' @ local frame {anchor}")
-        predictor.add_prompt(session_id=sid, frame_idx=anchor, text=prompt)
+    autocast_kwargs = (
+        dict(device_type="cuda", dtype=torch.bfloat16)
+        if torch.cuda.is_available() else dict(device_type="cpu", enabled=False)
+    )
 
-        # Forward then backward
-        for direction in ("forward", "backward"):
-            seen = 0
-            for response in predictor.propagate_in_video(
-                session_id=sid,
-                propagation_direction=direction,
-                start_frame_idx=None,
-                max_frame_num_to_track=n,
-            ):
-                fidx = response["frame_index"]
-                outputs = response["outputs"]
-                if fidx >= n:
-                    continue
-                result = _convert_video_output(outputs, frame_files[fidx], prompt, min_area)
-                per_frame[fidx] = result
-                seen += 1
-            print(f"  {direction}: {seen} frames")
+    try:
+        with torch.autocast(**autocast_kwargs):
+            # Text prompt is global — one call sets it for all frames.
+            # frame_idx is just where to anchor the initial inference.
+            anchor = keyframes[0]
+            print(f"  add_prompt text='{prompt}' @ local frame {anchor}")
+            predictor.add_prompt(session_id=sid, frame_idx=anchor, text=prompt)
+
+            # Forward then backward
+            for direction in ("forward", "backward"):
+                seen = 0
+                for response in predictor.propagate_in_video(
+                    session_id=sid,
+                    propagation_direction=direction,
+                    start_frame_idx=None,
+                    max_frame_num_to_track=n,
+                ):
+                    fidx = response["frame_index"]
+                    outputs = response["outputs"]
+                    if fidx >= n:
+                        continue
+                    result = _convert_video_output(outputs, frame_files[fidx], prompt, min_area)
+                    per_frame[fidx] = result
+                    seen += 1
+                print(f"  {direction}: {seen} frames")
     finally:
         predictor.close_session(session_id=sid)
 
@@ -350,12 +357,10 @@ def main():
     from sam3.model.sam3_video_predictor import Sam3VideoPredictor
     predictor = Sam3VideoPredictor(apply_temporal_disambiguation=True)
     print(f"Loaded in {time.time()-t0:.1f}s")
-    # Cast model weights to bf16 to match autocast inputs.
-    # Without this, SAM3 raises "Input type BFloat16 and bias type float should be the same"
-    # at sam_mask_decoder.conv_s0 (the conv layer's bias stays fp32 by default).
-    if torch.cuda.is_available():
-        predictor.model.to(dtype=torch.bfloat16)
-        print("  cast model to bfloat16")
+    # Model stays fp32; we wrap inference calls in torch.autocast(bf16) so
+    # PyTorch coherently casts inputs/activations across all layers.
+    # (Earlier attempts: casting weights to bf16 broke patch_embed; default fp32
+    # weights w/o autocast broke sam_mask_decoder.conv_s0.)
 
     # Optional threshold overrides (for Pass 2 / low-threshold reruns)
     if args.score_threshold is not None:
