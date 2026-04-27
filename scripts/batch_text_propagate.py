@@ -348,6 +348,12 @@ def main():
     from sam3.model.sam3_video_predictor import Sam3VideoPredictor
     predictor = Sam3VideoPredictor(apply_temporal_disambiguation=True)
     print(f"Loaded in {time.time()-t0:.1f}s")
+    # Cast model weights to bf16 to match autocast inputs.
+    # Without this, SAM3 raises "Input type BFloat16 and bias type float should be the same"
+    # at sam_mask_decoder.conv_s0 (the conv layer's bias stays fp32 by default).
+    if torch.cuda.is_available():
+        predictor.model.to(dtype=torch.bfloat16)
+        print("  cast model to bfloat16")
 
     # Optional threshold overrides (for Pass 2 / low-threshold reruns)
     if args.score_threshold is not None:
