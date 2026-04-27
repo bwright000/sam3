@@ -343,6 +343,8 @@ def main():
     else:
         eps_to_run = ["E_3", "F_3"]
 
+    import torch, gc
+
     print(f"Loading SAM3 video predictor (this takes ~25-30s)...")
     t0 = time.time()
     from sam3.model.sam3_video_predictor import Sam3VideoPredictor
@@ -364,8 +366,6 @@ def main():
         old = getattr(predictor.model, "new_det_thresh", None)
         predictor.model.new_det_thresh = float(args.new_det_thresh)
         print(f"  new_det_thresh: {old} -> {args.new_det_thresh}")
-
-    import torch, gc
 
     def _free_gpu():
         gc.collect()
