@@ -152,7 +152,8 @@ def render_overlays(snip_dir: Path, frame_files: list[Path],
 
 
 def write_annotated_masks(snip_dir: Path, frame_files: list[Path], split_size: int,
-                          unions: dict[int, np.ndarray], h: int, w: int) -> Path:
+                          unions: dict[int, np.ndarray], h: int, w: int,
+                          suffix: str = "") -> Path:
     images = []
     annotations = []
     ann_id = 1
@@ -188,7 +189,8 @@ def write_annotated_masks(snip_dir: Path, frame_files: list[Path], split_size: i
         ann_id += 1
 
     out = {"categories": [TOOL_CAT], "images": images, "annotations": annotations}
-    out_path = snip_dir / "annotated_masks.json"
+    fname = f"annotated_masks{suffix}.json"
+    out_path = snip_dir / fname
     tmp = out_path.with_suffix(".tmp")
     with open(tmp, "w") as f:
         json.dump(out, f)
@@ -198,7 +200,8 @@ def write_annotated_masks(snip_dir: Path, frame_files: list[Path], split_size: i
 
 def process_snippet(predictor, snip_dir: Path, prompt: str = "tool",
                     min_area: int = 100, do_render_overlays: bool = False,
-                    expected_tools: int | None = None) -> dict:
+                    expected_tools: int | None = None,
+                    output_suffix: str = "") -> dict:
     snip_id = snip_dir.name.split("_")[-1]
     ep = snip_dir.parent.name
     frames_dir = snip_dir / "frames_left"
@@ -251,7 +254,8 @@ def process_snippet(predictor, snip_dir: Path, prompt: str = "tool",
         predictor.close_session(session_id=sid)
 
     unions, counts = union_masks_per_frame(per_frame)
-    out_path = write_annotated_masks(snip_dir, frame_files, split_size, unions, h, w)
+    out_path = write_annotated_masks(snip_dir, frame_files, split_size, unions, h, w,
+                                     suffix=output_suffix)
 
     # Histogram of detection counts
     from collections import Counter
@@ -270,7 +274,7 @@ def process_snippet(predictor, snip_dir: Path, prompt: str = "tool",
     elapsed = time.time() - t0
 
     # Persist count stats next to annotated_masks.json for later analysis
-    stats_path = snip_dir / "tool_detection_stats.json"
+    stats_path = snip_dir / f"tool_detection_stats{output_suffix}.json"
     with open(stats_path, "w") as f:
         json.dump({
             "snippet": f"{ep}/{snip_dir.name}",
@@ -312,6 +316,14 @@ def main():
                     help="render per-frame overlay JPGs to snippet/overlays_tool/")
     ap.add_argument("--expected-json", default=None,
                     help="path to JSON {ep/snippet_id: expected_tool_count}")
+    ap.add_argument("--score-threshold", type=float, default=None,
+                    help="override Sam3VideoInference score_threshold_detection "
+                         "(default 0.5; lower = more permissive detector)")
+    ap.add_argument("--new-det-thresh", type=float, default=None,
+                    help="override Sam3VideoInference new_det_thresh "
+                         "(default 0.7; lower = spawns new tracks more eagerly)")
+    ap.add_argument("--output-suffix", default="",
+                    help="append to output filenames, e.g. '.lowthresh' for Pass 2")
     args = ap.parse_args()
 
     expected_map = {}
@@ -336,6 +348,16 @@ def main():
     from sam3.model.sam3_video_predictor import Sam3VideoPredictor
     predictor = Sam3VideoPredictor(apply_temporal_disambiguation=True)
     print(f"Loaded in {time.time()-t0:.1f}s")
+
+    # Optional threshold overrides (for Pass 2 / low-threshold reruns)
+    if args.score_threshold is not None:
+        old = getattr(predictor.model, "score_threshold_detection", None)
+        predictor.model.score_threshold_detection = float(args.score_threshold)
+        print(f"  score_threshold_detection: {old} -> {args.score_threshold}")
+    if args.new_det_thresh is not None:
+        old = getattr(predictor.model, "new_det_thresh", None)
+        predictor.model.new_det_thresh = float(args.new_det_thresh)
+        print(f"  new_det_thresh: {old} -> {args.new_det_thresh}")
 
     import torch, gc
 
@@ -363,16 +385,17 @@ def main():
             if not snip_dir.is_dir():
                 continue
             print(f"\n=== {ep}/{snip_dir.name} ===  {_free_gpu()}")
-            ann_path = snip_dir / "annotated_masks.json"
+            ann_path = snip_dir / f"annotated_masks{args.output_suffix}.json"
             if args.skip_if_exists and ann_path.exists():
-                print(f"  skip (annotated_masks.json exists)")
+                print(f"  skip ({ann_path.name} exists)")
                 continue
             try:
                 key = f"{ep}/{snip_dir.name.split('_')[-1]}"
                 expected = expected_map.get(key) or expected_map.get(f"{ep}/{snip_dir.name}")
                 info = process_snippet(predictor, snip_dir, args.prompt, args.min_area,
                                        do_render_overlays=args.render_overlays,
-                                       expected_tools=expected)
+                                       expected_tools=expected,
+                                       output_suffix=args.output_suffix)
                 summary.append(info)
                 hist_str = " ".join(f"{k}:{v}" for k, v in info["histogram"].items())
                 exp_str = (f"  expected={info['expected_tools']} matches={info['matches_expected_pct']}%"
