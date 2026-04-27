@@ -17,8 +17,11 @@ from pathlib import Path
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", required=True)
-    ap.add_argument("--suffix", default=".lowthresh",
-                    help="Pass 2 suffix, e.g. '.lowthresh'")
+    ap.add_argument("--suffixes", nargs="+", default=[".lowthresh", ".multiprompt", ".multiprompt_default"],
+                    help="Suffixes to compare against the canonical Pass 1; "
+                         "best across all wins.")
+    ap.add_argument("--suffix", default=None,
+                    help="(legacy single-suffix mode)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -27,54 +30,55 @@ def main():
     kept = []
     skipped = []
 
+    suffixes = [args.suffix] if args.suffix else args.suffixes
+
+    def score(d):
+        mp = d.get("matches_expected_pct")
+        if mp is not None:
+            return mp
+        hist = d.get("histogram", {})
+        n_zero = int(hist.get("0", 0))
+        total = d.get("frames", 1) or 1
+        return 100 * (1 - n_zero / total)
+
     for stats_p1 in sorted(root.glob("*/snippet_*/tool_detection_stats.json")):
         snip_dir = stats_p1.parent
-        stats_p2 = snip_dir / f"tool_detection_stats{args.suffix}.json"
-        if not stats_p2.exists():
-            skipped.append(snip_dir.name + " (no Pass 2)")
-            continue
-
-        d1 = json.load(open(stats_p1))
-        d2 = json.load(open(stats_p2))
-
-        # Score by match-expected if available, else by frames-with-any-detection
-        def score(d):
-            mp = d.get("matches_expected_pct")
-            if mp is not None:
-                return mp
-            hist = d.get("histogram", {})
-            n_zero = int(hist.get("0", 0))
-            total = d.get("frames", 1) or 1
-            # any-detection rate as fallback
-            return 100 * (1 - n_zero / total)
-
-        s1 = score(d1)
-        s2 = score(d2)
-
         rel = f"{snip_dir.parent.name}/{snip_dir.name}"
-        if s2 > s1:
-            promoted.append((rel, s1, s2))
-            if not args.dry_run:
-                shutil.copy2(stats_p2, stats_p1)
-                ann_p2 = snip_dir / f"annotated_masks{args.suffix}.json"
-                ann_p1 = snip_dir / "annotated_masks.json"
-                if ann_p2.exists():
-                    shutil.copy2(ann_p2, ann_p1)
-        else:
-            kept.append((rel, s1, s2))
+        d1 = json.load(open(stats_p1))
+        s1 = score(d1)
+        candidates = [("", d1, s1)]
+        for suf in suffixes:
+            ps = snip_dir / f"tool_detection_stats{suf}.json"
+            if not ps.exists():
+                continue
+            d = json.load(open(ps))
+            candidates.append((suf, d, score(d)))
 
-    print(f"\n{'snippet':<22} {'pass1':<8} {'pass2':<8} {'winner'}")
-    print("-" * 50)
-    for rel, s1, s2 in promoted:
-        print(f"  {rel:<22} {s1:>6.1f}% {s2:>6.1f}%  Pass 2")
-    for rel, s1, s2 in kept:
-        print(f"  {rel:<22} {s1:>6.1f}% {s2:>6.1f}%  Pass 1")
-    if skipped:
-        print("\nSkipped (no Pass 2):")
-        for s in skipped:
-            print(f"  {s}")
-    print(f"\nPromoted {len(promoted)} snippets to Pass 2."
-          f" Kept Pass 1 on {len(kept)}.")
+        # winner = highest score
+        candidates.sort(key=lambda c: -c[2])
+        winner_suf, winner_d, winner_score = candidates[0]
+        runner = candidates[1][2] if len(candidates) > 1 else None
+
+        if winner_suf == "":
+            kept.append((rel, candidates))
+        else:
+            promoted.append((rel, candidates, winner_suf))
+            if not args.dry_run:
+                shutil.copy2(snip_dir / f"tool_detection_stats{winner_suf}.json", stats_p1)
+                ann_w = snip_dir / f"annotated_masks{winner_suf}.json"
+                ann_can = snip_dir / "annotated_masks.json"
+                if ann_w.exists():
+                    shutil.copy2(ann_w, ann_can)
+
+    print(f"\n{'snippet':<22} {'scores per suffix (best first)':<60} {'winner'}")
+    print("-" * 100)
+    for rel, candidates, winner_suf in promoted:
+        ss = "  ".join(f"{c[0] or 'pass1'}={c[2]:.1f}%" for c in candidates)
+        print(f"  {rel:<22} {ss:<60} {winner_suf or 'pass1'}")
+    for rel, candidates in kept:
+        ss = "  ".join(f"{c[0] or 'pass1'}={c[2]:.1f}%" for c in candidates)
+        print(f"  {rel:<22} {ss:<60} pass1")
+    print(f"\nPromoted {len(promoted)} snippets. Kept pass1 on {len(kept)}.")
     if args.dry_run:
         print("(dry-run; re-run without --dry-run to apply)")
 
