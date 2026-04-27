@@ -202,6 +202,9 @@ def process_snippet(predictor, snip_dir: Path, prompt: str = "tool",
                     min_area: int = 100, do_render_overlays: bool = False,
                     expected_tools: int | None = None,
                     output_suffix: str = "") -> dict:
+    """prompt may be comma-separated to run multiple text prompts;
+    detections from all prompts are unioned per frame.
+    """
     snip_id = snip_dir.name.split("_")[-1]
     ep = snip_dir.parent.name
     frames_dir = snip_dir / "frames_left"
@@ -223,42 +226,61 @@ def process_snippet(predictor, snip_dir: Path, prompt: str = "tool",
 
     import torch
     t0 = time.time()
-    session = predictor.start_session(resource_path=str(frames_dir))
-    sid = session["session_id"]
-    per_frame: dict[int, dict] = {}
-
     autocast_kwargs = (
         dict(device_type="cuda", dtype=torch.bfloat16)
         if torch.cuda.is_available() else dict(device_type="cpu", enabled=False)
     )
 
-    try:
-        with torch.autocast(**autocast_kwargs):
-            # Text prompt is global — one call sets it for all frames.
-            # frame_idx is just where to anchor the initial inference.
-            anchor = keyframes[0]
-            print(f"  add_prompt text='{prompt}' @ local frame {anchor}")
-            predictor.add_prompt(session_id=sid, frame_idx=anchor, text=prompt)
+    # Parse comma-separated prompts; each runs as a fresh session and we union results.
+    prompts_list = [p.strip() for p in prompt.split(",") if p.strip()]
+    print(f"  prompts: {prompts_list}")
 
-            # Forward then backward
-            for direction in ("forward", "backward"):
-                seen = 0
-                for response in predictor.propagate_in_video(
-                    session_id=sid,
-                    propagation_direction=direction,
-                    start_frame_idx=None,
-                    max_frame_num_to_track=n,
-                ):
-                    fidx = response["frame_index"]
-                    outputs = response["outputs"]
-                    if fidx >= n:
-                        continue
-                    result = _convert_video_output(outputs, frame_files[fidx], prompt, min_area)
-                    per_frame[fidx] = result
-                    seen += 1
-                print(f"  {direction}: {seen} frames")
-    finally:
-        predictor.close_session(session_id=sid)
+    per_frame_per_prompt: dict[str, dict[int, dict]] = {}
+    anchor = keyframes[0]
+
+    for ptext in prompts_list:
+        session = predictor.start_session(resource_path=str(frames_dir))
+        sid = session["session_id"]
+        results_this_prompt: dict[int, dict] = {}
+        try:
+            with torch.autocast(**autocast_kwargs):
+                print(f"  [{ptext!r}] add_prompt @ local frame {anchor}")
+                predictor.add_prompt(session_id=sid, frame_idx=anchor, text=ptext)
+                for direction in ("forward", "backward"):
+                    seen = 0
+                    for response in predictor.propagate_in_video(
+                        session_id=sid,
+                        propagation_direction=direction,
+                        start_frame_idx=None,
+                        max_frame_num_to_track=n,
+                    ):
+                        fidx = response["frame_index"]
+                        outputs = response["outputs"]
+                        if fidx >= n:
+                            continue
+                        # Use canonical "tool" key so all prompts feed the same union
+                        result = _convert_video_output(outputs, frame_files[fidx], "tool", min_area)
+                        results_this_prompt[fidx] = result
+                        seen += 1
+                    print(f"  [{ptext!r}] {direction}: {seen} frames")
+        finally:
+            predictor.close_session(session_id=sid)
+        per_frame_per_prompt[ptext] = results_this_prompt
+
+    # Merge all prompt results into a single per_frame dict whose tool-list is the
+    # concatenation across prompts (deduplication via mask union happens in
+    # union_masks_per_frame downstream).
+    per_frame: dict[int, dict] = {}
+    for ptext, results in per_frame_per_prompt.items():
+        for fidx, result in results.items():
+            if fidx not in per_frame:
+                per_frame[fidx] = {
+                    "frame": result["frame"],
+                    "height": result["height"],
+                    "width": result["width"],
+                    "masks": {"tool": []},
+                }
+            per_frame[fidx]["masks"]["tool"].extend(result.get("masks", {}).get("tool", []))
 
     unions, counts = union_masks_per_frame(per_frame)
     out_path = write_annotated_masks(snip_dir, frame_files, split_size, unions, h, w,
