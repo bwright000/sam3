@@ -39,13 +39,15 @@ from .sam3_service import SAM3Service
 
 NO_MODEL = os.environ.get("SAM3_ANNOT_NO_MODEL", "0") == "1"
 NO_TEXT = os.environ.get("SAM3_ANNOT_NO_TEXT", "0") == "1"
+LIGHTWEIGHT = os.environ.get("SAM3_ANNOT_LIGHTWEIGHT", "0") == "1"
 
 
 # ---------- Global app state ----------
 
 class AppState:
     def __init__(self):
-        self.sam3 = SAM3Service(no_model=NO_MODEL, enable_text=not NO_TEXT)
+        self.sam3 = SAM3Service(no_model=NO_MODEL, enable_text=not NO_TEXT,
+                                 lightweight=LIGHTWEIGHT)
         self.snippet: Optional[storage.SnippetInfo] = None
         # approved_masks: {frame_idx: {category: uint8 mask}}
         self.approved: dict[int, dict[str, np.ndarray]] = {}
@@ -155,6 +157,7 @@ def api_health():
         "gpu": gpu,
         "no_model": NO_MODEL,
         "no_text": NO_TEXT,
+        "lightweight": LIGHTWEIGHT,
         "model_loaded": STATE.sam3.predictor is not None,
         "image_model_loaded": STATE.sam3._image_processor is not None,
         "data_dir": str(data_dir),
@@ -309,13 +312,14 @@ async def startup():
         except Exception as e:
             logger.exception("model load failed at startup; will retry on first request")
             # Don't crash the server — let /api/health surface the error
-        # Eager-load the image model too if text prompting is enabled.
-        # Avoids a slow first text request (which often 504s through tunnels).
-        if not NO_TEXT:
+        # Eager-load the image model when text is enabled OR when running
+        # lightweight (where it also handles click/box). Avoids a slow first
+        # request that often 504s through tunnels.
+        if not NO_TEXT or LIGHTWEIGHT:
             try:
                 STATE.sam3.ensure_image_model()
             except Exception:
-                logger.exception("image model load failed at startup; text prompts will retry on demand")
+                logger.exception("image model load failed at startup; will retry on demand")
 
 
 # ---------- Session + metadata ----------
@@ -377,11 +381,13 @@ def api_session_open(req: OpenSnippetReq):
         "n_frames": len(snippet.frame_files),
         "width": snippet.width,
         "height": snippet.height,
-        "split_size": snippet.split_size,
+        "split_size": snippet.split_size,  # may be null for cluster snippets
+        "frames_dir_name": snippet.frames_dir_name,
         "start_frame": snippet.start_frame,
         "end_frame": snippet.end_frame,
         "categories": STATE.categories,
         "restored_anchors": sum(len(v) for v in STATE.approved.values()),
+        "lightweight": LIGHTWEIGHT,
     }
 
 
@@ -735,6 +741,13 @@ class PropagateReq(BaseModel):
 def api_propagate(req: PropagateReq):
     if STATE.snippet is None:
         raise HTTPException(400, "no snippet open")
+    if LIGHTWEIGHT:
+        raise HTTPException(
+            503,
+            "propagate is disabled in lightweight mode. Anchors are saved "
+            "to session_autosave.json — re-run on a stronger GPU "
+            "(--no-lightweight) or use scripts/propagate_from_autosave.py.",
+        )
     t0 = time.time()
     obj_results = STATE.sam3.propagate_bidir(
         anchor_frame_idx=req.frame_idx,

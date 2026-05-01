@@ -20,9 +20,11 @@ const S = {
   nFrames: 0,
   width: 0,
   height: 0,
-  splitSize: 120,
+  splitSize: null,        // null for cluster-format snippets
+  framesDirName: 'frames_left',
   startFrame: 0,
   endFrame: 0,
+  lightweight: false,
   categories: [],
   activeCategory: null,
   activeTool: 'brush',
@@ -192,11 +194,17 @@ async function loadFrame(idx) {
 function updateFrameInfo() {
   if (!S.snippet) return;
   const frameNum = S.startFrame + S.frameIdx;
-  const split = Math.floor(frameNum / S.splitSize);
-  const offset = frameNum % S.splitSize;
-  const isKf = offset === 0 ? ' [KF]' : '';
-  $('#frame-info').textContent =
-    `Frame ${S.frameIdx + 1}/${S.nFrames} · #${frameNum} · split ${split} offset ${offset}${isKf}`;
+  if (S.splitSize && S.splitSize > 0) {
+    const split = Math.floor(frameNum / S.splitSize);
+    const offset = frameNum % S.splitSize;
+    const isKf = offset === 0 ? ' [KF]' : '';
+    $('#frame-info').textContent =
+      `Frame ${S.frameIdx + 1}/${S.nFrames} · #${frameNum} · split ${split} offset ${offset}${isKf}`;
+  } else {
+    // Cluster-format snippet: no split layout, just show frame index + abs num.
+    $('#frame-info').textContent =
+      `Frame ${S.frameIdx + 1}/${S.nFrames} · #${frameNum}`;
+  }
 }
 
 // ---------- Overlays ----------
@@ -991,6 +999,24 @@ async function refreshSnippets() {
   }
   if (r.snippets.length > 0) dd.value = r.snippets[0].snippet_id;
 }
+function applyLightweightUI() {
+  // Disable the Propagate button + slider when in lightweight mode.
+  const btn = $('#prop-btn');
+  const slider = $('#prop-n');
+  if (!btn) return;
+  if (S.lightweight) {
+    btn.disabled = true;
+    btn.textContent = 'Propagate (disabled)';
+    btn.title = 'Lightweight mode: anchors are saved only. Use scripts/propagate_from_autosave.py on a stronger GPU.';
+    if (slider) slider.disabled = true;
+  } else {
+    btn.disabled = false;
+    btn.textContent = 'Propagate';
+    btn.title = '';
+    if (slider) slider.disabled = false;
+  }
+}
+
 async function loadSnippet() {
   const ep = $('#episode-dd').value;
   const sid = $('#snippet-dd').value;
@@ -1008,10 +1034,13 @@ async function loadSnippet() {
     S.width = r.width;
     S.height = r.height;
     S.splitSize = r.split_size;
+    S.framesDirName = r.frames_dir_name || 'frames_left';
     S.startFrame = r.start_frame;
     S.endFrame = r.end_frame;
     S.categories = r.categories;
     S.activeCategory = S.categories[0];
+    S.lightweight = !!r.lightweight;
+    applyLightweightUI();
 
     $('#frame-slider').max = Math.max(0, S.nFrames - 1);
     $('#frame-slider').value = 0;
@@ -1019,7 +1048,8 @@ async function loadSnippet() {
     renderCategoryList();
     await loadFrame(0);
     refreshMasksList();
-    setStatus(`loaded ${r.episode}/${r.snippet_id} · ${r.n_frames} frames · restored ${r.restored_anchors} anchors`);
+    const lwTag = S.lightweight ? ' [LIGHTWEIGHT — propagate disabled]' : '';
+    setStatus(`loaded ${r.episode}/${r.snippet_id} · ${r.n_frames} frames · restored ${r.restored_anchors} anchors${lwTag}`);
   } catch (e) {
     setStatus(`load failed: ${e.message}`);
   }
@@ -1116,7 +1146,14 @@ function bindEvents() {
     else if (e.key === 't') selectTool('sam-text');
     else if (e.key === 'g') loadGTEditable();
     else if (e.key === 'Enter') { e.preventDefault(); commitAnchor(); }
-    else if (e.key === ' ') { e.preventDefault(); propagate(); }
+    else if (e.key === ' ') {
+      e.preventDefault();
+      if (S.lightweight) {
+        setStatus('lightweight mode: propagate disabled. Save anchors and replay on a stronger GPU.');
+      } else {
+        propagate();
+      }
+    }
     else if (e.key === 'z' && (e.ctrlKey || e.metaKey) && e.shiftKey) { e.preventDefault(); undoAction(); }
     else if (e.key === 'Z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); undoAction(); }
     else if (e.key === 'y' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); redoAction(); }

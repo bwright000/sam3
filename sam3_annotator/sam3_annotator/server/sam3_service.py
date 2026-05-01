@@ -19,9 +19,19 @@ from .storage import SnippetInfo
 
 
 class SAM3Service:
-    def __init__(self, no_model: bool = False, enable_text: bool = True):
+    def __init__(self, no_model: bool = False, enable_text: bool = True,
+                 lightweight: bool = False):
+        """
+        no_model: skip all SAM3 model loading (UI dev / smoke tests).
+        enable_text: load the image-level text-detection head.
+        lightweight: skip the video tracker entirely. Click/box/text run on the
+            image-level model only; commit just stores the painted mask;
+            propagate is hard-disabled. Designed for low-VRAM GPUs (e.g. GTX
+            970) where init_state on a long snippet OOMs/TDRs.
+        """
         self.no_model = no_model
         self.enable_text = enable_text
+        self.lightweight = lightweight
         self.predictor = None
         self.tracker = None
         self._state = None
@@ -30,7 +40,8 @@ class SAM3Service:
         self._lock = threading.Lock()
         # obj_id assignment per category for current snippet
         self._cat_to_objid: dict[str, int] = {}
-        # Lazy-loaded image-level model for text prompting (separate from tracker)
+        # Lazy-loaded image-level model. Used for text prompting always; in
+        # lightweight mode it also handles click/box via inst_interactive_predictor.
         self._image_model = None
         self._image_processor = None
 
@@ -38,6 +49,10 @@ class SAM3Service:
 
     def load_model(self) -> None:
         if self.no_model:
+            return
+        if self.lightweight:
+            # Skip the video tracker entirely. Image model is loaded on-demand
+            # by ensure_image_model (or eagerly at startup, see app.py).
             return
         if self.predictor is not None:
             return
@@ -73,6 +88,12 @@ class SAM3Service:
         """Load the current snippet's frames into tracker GPU state if not done."""
         if self.no_model:
             return
+        if self.lightweight:
+            raise RuntimeError(
+                "tracker disabled in lightweight mode — propagate / tracker "
+                "preview unavailable. Save anchors and re-run with full mode "
+                "(or scripts/propagate_from_autosave.py on a stronger GPU)."
+            )
         with self._lock:
             if self._state is not None:
                 return
@@ -107,6 +128,8 @@ class SAM3Service:
         """
         if self.no_model:
             raise RuntimeError("model disabled (--no-model)")
+        if self.lightweight:
+            return self._preview_click_image_only(frame_idx, points=points, box=box)
         self.ensure_tracker_loaded()
         with self._lock:
             obj_id = self.cat_to_objid(category)
@@ -141,6 +164,65 @@ class SAM3Service:
                     return (mnp > 0.0).astype(np.uint8)
         return np.zeros((self._snippet.height, self._snippet.width), dtype=np.uint8)
 
+    def _preview_click_image_only(self, frame_idx: int,
+                                   points: list[tuple[float, float, int]] | None = None,
+                                   box: tuple[float, float, float, float] | None = None,
+                                   ) -> np.ndarray:
+        """Lightweight-mode click/box: image-level SAM3, no video tracker.
+
+        Uses image_model.inst_interactive_predictor (SAM3InteractiveImagePredictor).
+        Picks the best of multimask_output by IoU score. Output is a binary
+        mask at original image resolution.
+        """
+        self.ensure_image_model()
+        if self._snippet is None:
+            raise RuntimeError("no snippet open")
+        inst = getattr(self._image_model, "inst_interactive_predictor", None)
+        if inst is None:
+            raise RuntimeError(
+                "image model has no inst_interactive_predictor; "
+                "rebuild with enable_inst_interactivity=True"
+            )
+
+        from PIL import Image
+        fpath = self._snippet.frame_files[frame_idx]
+        img = Image.open(fpath).convert("RGB")
+        H, W = self._snippet.height, self._snippet.width
+
+        with self._lock:
+            inst.set_image(img)
+
+            point_coords = None
+            point_labels = None
+            if points:
+                point_coords = np.array([[p[0], p[1]] for p in points], dtype=np.float32)
+                point_labels = np.array([p[2] for p in points], dtype=np.int32)
+            box_arr = None
+            if box is not None:
+                box_arr = np.array([box[0], box[1], box[2], box[3]], dtype=np.float32)
+
+            masks, ious, _ = inst.predict(
+                point_coords=point_coords,
+                point_labels=point_labels,
+                box=box_arr,
+                multimask_output=True,
+                return_logits=False,
+                normalize_coords=True,
+            )
+        # masks: (C, H, W) float; ious: (C,)
+        if masks.ndim == 3 and masks.shape[0] > 0:
+            best = int(np.argmax(ious))
+            m = masks[best]
+        elif masks.ndim == 2:
+            m = masks
+        else:
+            return np.zeros((H, W), dtype=np.uint8)
+        m = (m > 0.0).astype(np.uint8)
+        if m.shape != (H, W):
+            import cv2
+            m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+        return m
+
     # -------- commit painted mask as anchor --------
 
     def commit_anchor(self, frame_idx: int, category: str,
@@ -148,8 +230,17 @@ class SAM3Service:
         """Preprocess painted mask and register with the tracker via add_new_mask.
 
         Returns the refined mask SAM3 actually uses (at video resolution).
+
+        In lightweight mode (no video tracker), the cleaned mask is just
+        returned and the caller stores it. A later A100 run replays these
+        anchors via scripts/propagate_from_autosave.py.
         """
         if self.no_model:
+            return preprocess_painted_mask(painted_mask)
+        if self.lightweight:
+            # Allocate the obj_id so the autosave carries cat_to_objid for
+            # downstream replay, but do NOT touch the tracker.
+            self.cat_to_objid(category)
             return preprocess_painted_mask(painted_mask)
         self.ensure_tracker_loaded()
         with self._lock:
@@ -179,6 +270,12 @@ class SAM3Service:
         """
         if self.no_model:
             return {}
+        if self.lightweight:
+            raise RuntimeError(
+                "propagate is disabled in lightweight mode — anchors are "
+                "saved to session_autosave.json. Re-run on a stronger GPU "
+                "with --no-lightweight, or use scripts/propagate_from_autosave.py."
+            )
         self.ensure_tracker_loaded()
         results: dict[int, dict[int, np.ndarray]] = {}
         with self._lock:
@@ -215,14 +312,19 @@ class SAM3Service:
     # -------- text prompting (separate image model) --------
 
     def ensure_image_model(self) -> None:
-        if self.no_model or not self.enable_text:
+        # In lightweight mode the image model handles click/box too, so it must
+        # load even when text is disabled.
+        if self.no_model:
+            return
+        if not self.enable_text and not self.lightweight:
             return
         if self._image_processor is not None:
             return
         from sam3.model_builder import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
         t0 = time.time()
-        print("[sam3_service] loading image model for text prompting...")
+        print("[sam3_service] loading image model "
+              f"({'lightweight click/box + text' if self.lightweight else 'text prompting'})...")
         self._image_model = build_sam3_image_model()
         self._image_processor = Sam3Processor(self._image_model)
         print(f"[sam3_service] image model loaded in {time.time()-t0:.1f}s")

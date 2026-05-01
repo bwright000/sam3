@@ -131,6 +131,11 @@ def process_snippet(predictor, snip_dir, seeds, output_suffix, expected_tools,
     split_size = get_split_size(snip_dir, snip_id)
 
     tracker = predictor.model.tracker
+    # Wire detector backbone onto the tracker so _get_image_feature can compute
+    # features lazily for any frame_idx the caller hands to add_new_mask /
+    # add_new_points_or_box (otherwise raises "Image features for frame X are
+    # not cached" before propagate_in_video_preflight runs).
+    tracker.backbone = predictor.model.detector.backbone
 
     print(f"  Loading {n} frames into tracker...")
     images, video_h, video_w = _load_frames_for_tracker(frame_files, n, tracker.image_size)

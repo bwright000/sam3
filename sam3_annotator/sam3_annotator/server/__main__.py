@@ -29,6 +29,14 @@ def main():
                     help="Skip SAM3 model loading (UI dev / smoke testing only)")
     ap.add_argument("--no-text", action="store_true",
                     help="Disable text prompting (saves ~3GB VRAM)")
+    ap.add_argument("--lightweight", action="store_true",
+                    help="Lightweight annotation-only mode: no video tracker, "
+                         "no propagation. Click/box/text use the image-level "
+                         "model only. Designed for low-VRAM GPUs (e.g. GTX 970) "
+                         "where loading a long snippet's frames into the "
+                         "tracker would OOM/TDR. Anchors are saved to "
+                         "session_autosave.json for later replay via "
+                         "scripts/propagate_from_autosave.py.")
     ap.add_argument("--log-level", default="info",
                     choices=["debug", "info", "warning", "error"],
                     help="Logging verbosity")
@@ -63,6 +71,9 @@ def main():
     os.environ["SAM3_ANNOT_DATA_DIR"] = str(data_dir)
     os.environ["SAM3_ANNOT_NO_MODEL"] = "1" if args.no_model else "0"
     os.environ["SAM3_ANNOT_NO_TEXT"] = "1" if args.no_text else "0"
+    os.environ["SAM3_ANNOT_LIGHTWEIGHT"] = "1" if args.lightweight else "0"
+    if args.lightweight:
+        log.info("lightweight mode: no video tracker, propagate disabled")
 
     import uvicorn
     uvicorn.run(

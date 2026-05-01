@@ -7,6 +7,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -15,16 +16,23 @@ from PIL import Image
 from .rle import mask_to_rle, rle_to_mask, mask_to_polygons
 
 
+# Frame directories we accept, in priority order. The first that contains
+# frame_*.{webp,png,jpg} wins. `frames_left` is the legacy CRCD-master layout;
+# `rgb` is the TUM/Replica-style cluster-snippet layout (see F_1/snippet_001).
+_FRAMES_DIR_CANDIDATES = ("frames_left", "rgb")
+
+
 @dataclass
 class SnippetInfo:
     episode: str
     snippet_id: str
     root: Path              # snippet dir
-    frames_dir: Path        # frames_left/
+    frames_dir: Path        # the actual dir used (frames_left/ or rgb/)
+    frames_dir_name: str    # basename of frames_dir, for export-relative paths
     frame_files: list[Path]
     width: int
     height: int
-    split_size: int
+    split_size: Optional[int]   # None for cluster-format snippets (no split layout)
     start_frame: int
     end_frame: int
 
@@ -54,36 +62,54 @@ def list_snippets(episode: str) -> list[dict]:
 
 
 def load_snippet(episode: str, snippet_id: str) -> SnippetInfo:
-    """Load a snippet's frame metadata. Does NOT load frame pixels."""
+    """Load a snippet's frame metadata. Does NOT load frame pixels.
+
+    Tries frame directories in priority order (`frames_left/`, then `rgb/`)
+    so both legacy CRCD-master and new TUM-style cluster snippets work.
+    """
     root = data_dir() / episode / f"snippet_{snippet_id}"
     if not root.is_dir():
         raise FileNotFoundError(f"snippet dir not found: {root}")
 
-    frames_dir = root / "frames_left"
-    frame_files = sorted(frames_dir.glob("frame_*.webp"))
-    if not frame_files:
-        frame_files = sorted(frames_dir.glob("frame_*.png"))
-    if not frame_files:
-        frame_files = sorted(frames_dir.glob("frame_*.jpg"))
-    if not frame_files:
-        raise FileNotFoundError(f"no frame files in {frames_dir}")
+    frames_dir = None
+    frame_files: list[Path] = []
+    for cand in _FRAMES_DIR_CANDIDATES:
+        d = root / cand
+        if not d.is_dir():
+            continue
+        for ext in ("webp", "png", "jpg"):
+            files = sorted(d.glob(f"frame_*.{ext}"))
+            if files:
+                frame_files = files
+                frames_dir = d
+                break
+        if frame_files:
+            break
+    if not frame_files or frames_dir is None:
+        tried = ", ".join(_FRAMES_DIR_CANDIDATES)
+        raise FileNotFoundError(
+            f"no frame files in {root} (tried subdirs: {tried})"
+        )
 
     # Peek at first frame to get H/W
     with Image.open(frame_files[0]) as im:
         w, h = im.size
 
-    # Snippet meta from episode snippets.json
+    # Snippet meta from episode snippets.json. Cluster-format snippets don't
+    # carry split_size; leave as None and downstream code adapts.
     all_meta = list_snippets(episode)
     s = next((m for m in all_meta if m["snippet_id"] == snippet_id), None)
     if s is None:
         raise ValueError(f"snippet {snippet_id} not in {episode}_snippets.json")
-    split_size = int(s.get("split_size", 120))
+    raw_split = s.get("split_size")
+    split_size = int(raw_split) if raw_split is not None else None
 
     return SnippetInfo(
         episode=episode,
         snippet_id=snippet_id,
         root=root,
         frames_dir=frames_dir,
+        frames_dir_name=frames_dir.name,
         frame_files=frame_files,
         width=w,
         height=h,
@@ -223,11 +249,18 @@ def export_coco(snippet: SnippetInfo,
             continue
         fpath = snippet.frame_files[fidx]
         frame_num = int(fpath.stem.split("_")[1])
-        split_num = frame_num // snippet.split_size
-        offset = frame_num % snippet.split_size
+        if snippet.split_size:
+            # Legacy split-imgs layout: file_name points at the canonical
+            # split_imgs path used by the master CRCD COCO files.
+            split_num = frame_num // snippet.split_size
+            offset = frame_num % snippet.split_size
+            file_name = f"./split_imgs/split_{split_num}/{offset:05d}.jpg"
+        else:
+            # Cluster/TUM layout: point at the actual frame file in this snippet.
+            file_name = f"./{snippet.frames_dir_name}/{fpath.name}"
         images_list.append({
             "id": frame_num,
-            "file_name": f"./split_imgs/split_{split_num}/{offset:05d}.jpg",
+            "file_name": file_name,
             "height": snippet.height,
             "width": snippet.width,
         })
