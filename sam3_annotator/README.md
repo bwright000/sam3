@@ -88,6 +88,8 @@ If your dataset uses a different layout you'll need to adapt `sam3_annotator/ser
 | Ctrl+Z | Undo stroke |
 | ← → | Prev / Next frame |
 | Shift+← → | ±10 frames |
+| PgUp / PgDn | Prev / Next keyframe (split-size boundary) |
+| Home / End | First / Last frame in snippet |
 
 ## Health
 

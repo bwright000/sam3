@@ -1431,7 +1431,35 @@ function bindEvents() {
     else if (e.key === ']') { $('#brush-size').value = Math.min(80, S.brushSize + 2); $('#brush-size').dispatchEvent(new Event('input')); }
     else if (e.key === 'ArrowLeft') { const step = e.shiftKey ? 10 : 1; loadFrame(Math.max(0, S.frameIdx - step)); }
     else if (e.key === 'ArrowRight') { const step = e.shiftKey ? 10 : 1; loadFrame(Math.min(S.nFrames - 1, S.frameIdx + step)); }
+    else if (e.key === 'PageUp') { e.preventDefault(); loadFrame(findPrevKeyframe()); }
+    else if (e.key === 'PageDown') { e.preventDefault(); loadFrame(findNextKeyframe()); }
+    else if (e.key === 'Home') { e.preventDefault(); loadFrame(0); }
+    else if (e.key === 'End') { e.preventDefault(); loadFrame(S.nFrames - 1); }
   });
+}
+
+// ---------- Keyframe navigation ----------
+// A keyframe is a frame whose absolute video number is a multiple of the
+// snippet's split_size. Cluster-format snippets have no split layout
+// (S.splitSize is 0/null) -- in that case PageUp/PageDown act as ±1 frame.
+function isKeyframeAt(idx) {
+  if (!S.splitSize || S.splitSize <= 0) return false;
+  const frameNum = S.startFrame + idx;
+  return frameNum % S.splitSize === 0;
+}
+function findPrevKeyframe() {
+  if (!S.splitSize || S.splitSize <= 0) return Math.max(0, S.frameIdx - 1);
+  for (let i = S.frameIdx - 1; i >= 0; i--) {
+    if (isKeyframeAt(i)) return i;
+  }
+  return 0;
+}
+function findNextKeyframe() {
+  if (!S.splitSize || S.splitSize <= 0) return Math.min(S.nFrames - 1, S.frameIdx + 1);
+  for (let i = S.frameIdx + 1; i < S.nFrames; i++) {
+    if (isKeyframeAt(i)) return i;
+  }
+  return S.nFrames - 1;
 }
 function selectTool(name) {
   const b = document.querySelector(`.tool-btn[data-tool="${name}"]`);
