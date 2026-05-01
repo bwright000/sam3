@@ -344,6 +344,16 @@ function onPointerDown(e) {
       opacity: S.activeTool === 'eraser' ? 1 : 0.7,
       globalCompositeOperation: S.activeTool === 'eraser' ? 'destination-out' : 'source-over',
     });
+    // Tag the stroke with the category active at draw time. commitAnchor
+    // groups by this attribute so each category's strokes are committed as
+    // their own mask -- prevents the bug where switching active category
+    // before committing made every prior stroke take on the latest cat.
+    currentStroke.setAttr('cat', S.activeCategory);
+    if (S.activeTool === 'eraser') {
+      // Eraser is destination-out; the cat tag here is just so removal
+      // semantics travel with the stroke alongside other same-cat work.
+      currentStroke.setAttr('isEraser', true);
+    }
     editLayer.add(currentStroke);
     editLayer.batchDraw();
   } else if (S.activeTool === 'fill') {
@@ -571,14 +581,19 @@ function bucketFill(seedX, seedY) {
   }
   tctx.putImageData(imgData, 0, 0);
 
-  // Replace the edit layer with the filled raster (collapses prior strokes
-  // into a single Konva.Image — that's fine; commit threshold is unchanged).
-  editLayer.destroyChildren();
-  editLayer.add(new Konva.Image({
+  // Replace ONLY this category's children with the filled raster -- preserve
+  // any other-category strokes the user has on the edit layer. (Bucket fill
+  // used to nuke the entire edit layer, taking other cats' work with it.)
+  const activeCat = S.activeCategory;
+  const toRemove = editLayer.getChildren().filter(c => c.getAttr('cat') === activeCat);
+  toRemove.forEach(c => c.destroy());
+  const filledImg = new Konva.Image({
     image: tmp,
     width: stage.width(),
     height: stage.height(),
-  }));
+  });
+  filledImg.setAttr('cat', activeCat);
+  editLayer.add(filledImg);
   editLayer.batchDraw();
   S.undoStack.push({ type: 'raster', canvas: undoCanvas });
   setStatus(`fill: +${filled}px (${pct.toFixed(1)}% of frame)`);
@@ -602,51 +617,98 @@ function undo() {
 }
 
 // ---------- Commit: edit layer → PNG → POST ----------
+// Walks the edit-layer children, groups them by their `cat` attribute (set at
+// draw-time / fill-time / load-GT-time), and POSTs one anchor commit per
+// category so each category's strokes are saved under the correct mask --
+// not lumped into whatever the active category happens to be at commit time.
 async function commitAnchor() {
   if (!S.snippet) { setStatus('no snippet'); return; }
   if (!S.activeCategory) { setStatus('pick an active category'); return; }
 
-  // Render ONLY the edit layer as an opaque mask at original resolution.
-  // We draw the edit layer onto a new canvas, then threshold alpha.
   const origW = S.width;
   const origH = S.height;
-  const tmp = document.createElement('canvas');
-  tmp.width = origW;
-  tmp.height = origH;
-  const tctx = tmp.getContext('2d');
-  // The edit layer canvas is at display resolution; scale up.
-  const editCanvas = editLayer.toCanvas({ width: stage.width(), height: stage.height(), pixelRatio: 1 });
-  tctx.drawImage(editCanvas, 0, 0, origW, origH);
-  // Threshold alpha to produce a binary mask (white where drawn)
-  const imgData = tctx.getImageData(0, 0, origW, origH);
-  const d = imgData.data;
-  for (let i = 0; i < d.length; i += 4) {
-    const has = d[i+3] > 20 ? 255 : 0;
-    d[i] = has; d[i+1] = has; d[i+2] = has; d[i+3] = has;
-  }
-  tctx.putImageData(imgData, 0, 0);
-  const dataUrl = tmp.toDataURL('image/png');
 
-  setStatus('committing anchor…');
+  // Group children by category. Untagged children (legacy paint or things we
+  // didn't tag) fall through under the active category as a safety net.
+  const byCat = new Map();
+  for (const child of editLayer.getChildren()) {
+    const cat = child.getAttr('cat') || S.activeCategory;
+    if (!byCat.has(cat)) byCat.set(cat, []);
+    byCat.get(cat).push(child);
+  }
+
+  if (byCat.size === 0) {
+    setStatus('nothing on edit layer to commit');
+    return;
+  }
+
+  // For each category, render ONLY its children on a hidden Konva layer, then
+  // export to PNG and POST. This isolates per-category strokes regardless of
+  // z-order on the edit layer. We render at display resolution then scale up.
+  const stageW = stage.width();
+  const stageH = stage.height();
+
+  setStatus(`committing ${byCat.size} categor${byCat.size === 1 ? 'y' : 'ies'}…`);
+  const results = [];
+  let totalPixels = 0;
+
+  for (const [cat, nodes] of byCat) {
+    const isolation = new Konva.Layer({ listening: false });
+    stage.add(isolation);
+    try {
+      for (const node of nodes) isolation.add(node.clone({ listening: false }));
+      isolation.batchDraw();
+      const isolationCanvas = isolation.toCanvas({ width: stageW, height: stageH, pixelRatio: 1 });
+      const tmp = document.createElement('canvas');
+      tmp.width = origW; tmp.height = origH;
+      const tctx = tmp.getContext('2d');
+      tctx.drawImage(isolationCanvas, 0, 0, origW, origH);
+      const imgData = tctx.getImageData(0, 0, origW, origH);
+      const d = imgData.data;
+      let on = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        const has = d[i + 3] > 20 ? 255 : 0;
+        d[i] = has; d[i + 1] = has; d[i + 2] = has; d[i + 3] = has;
+        if (has) on++;
+      }
+      if (on === 0) {
+        // All strokes on this cat were eraser-only -- skip it; nothing to commit
+        continue;
+      }
+      tctx.putImageData(imgData, 0, 0);
+      const dataUrl = tmp.toDataURL('image/png');
+      const r = await apiPost('/api/anchor/commit', {
+        frame_idx: S.frameIdx,
+        category: cat,
+        mask_png_b64: dataUrl,
+      });
+      results.push(`${cat}=${r.pixels}px`);
+      totalPixels += r.pixels || 0;
+    } catch (e) {
+      setStatus(`commit failed for ${cat}: ${e.message}`);
+      isolation.destroy();
+      return;
+    }
+    isolation.destroy();
+  }
+
+  if (results.length === 0) {
+    setStatus('commit: nothing to save (eraser-only edit?)');
+  } else {
+    setStatus(`committed: ${results.join(', ')} (${totalPixels}px total)`);
+  }
+  // Refresh approved masks for this frame
   try {
-    const r = await apiPost('/api/anchor/commit', {
-      frame_idx: S.frameIdx,
-      category: S.activeCategory,
-      mask_png_b64: dataUrl,
-    });
-    setStatus(`anchor committed: ${r.pixels}px ${S.activeCategory}`);
-    // Refresh approved masks for this frame
     const m = await apiGet(`/api/masks/${S.frameIdx}`);
     S.approved = m.approved || {};
     S.propagated = m.propagated || {};
-    editLayer.destroyChildren();
-    editLayer.batchDraw();
-    S.editingGT.delete(S.activeCategory);
-    renderOverlays();
-    refreshMasksList();
-  } catch (e) {
-    setStatus(`commit failed: ${e.message}`);
-  }
+  } catch (_) {}
+  editLayer.destroyChildren();
+  editLayer.batchDraw();
+  // Any GT we'd pulled onto the edit layer is now committed back into approved
+  for (const cat of byCat.keys()) S.editingGT.delete(cat);
+  renderOverlays();
+  refreshMasksList();
 }
 
 // ---------- Preview (SAM3 click/box) ----------
@@ -892,12 +954,16 @@ async function loadGTEditable() {
   // (Konva.Line is a vector primitive; its stroke pixels are redrawn each frame
   //  and would persist through eraser strokes. A raster image is fully editable.)
   pushEditLayerUndo('load-gt');
-  editLayer.destroyChildren();
+  // Only clear the *active category* off the edit layer -- preserve any other
+  // cats' strokes the user is mid-way through.
+  const activeCat = S.activeCategory;
+  editLayer.getChildren().filter(c => c.getAttr('cat') === activeCat)
+                    .forEach(c => c.destroy());
   const W = S.width, H = S.height;
   const cvs = document.createElement('canvas');
   cvs.width = W; cvs.height = H;
   const ctx = cvs.getContext('2d');
-  const col = catColor(S.activeCategory);
+  const col = catColor(activeCat);
   ctx.fillStyle = col + 'CC';  // ~80% alpha
   for (const flat of polys) {
     if (flat.length < 6) continue;  // need ≥3 points
@@ -910,11 +976,13 @@ async function loadGTEditable() {
     ctx.closePath();
     ctx.fill();
   }
-  editLayer.add(new Konva.Image({
+  const gtImg = new Konva.Image({
     image: cvs,
     width: stage.width(),
     height: stage.height(),
-  }));
+  });
+  gtImg.setAttr('cat', activeCat);
+  editLayer.add(gtImg);
   editLayer.batchDraw();
   // Hide the GT outline for this category so it doesn't look un-erasable
   S.editingGT.add(S.activeCategory);
