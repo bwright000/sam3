@@ -48,12 +48,20 @@ FILL_ALPHA = 0.35
 def render_frame_overlay(frame_bgr: np.ndarray,
                          polys_by_cat: dict[str, list[list[float]]],
                          counts: dict[str, int]) -> np.ndarray:
-    """Draw filled+outlined polys with category counter."""
+    """Draw filled+outlined polys with category counter.
+
+    Categories are drawn in priority order (lowest first, highest paints last
+    so its fill/outline sit on top): Tool < Liver < Gallbladder. Other
+    categories fall to the back.
+    """
+    PRIORITY = {"Tool": 0, "Liver": 2, "Gallbladder": 3}
+    items = sorted(polys_by_cat.items(), key=lambda kv: PRIORITY.get(kv[0], 1))
+
     overlay = frame_bgr.copy()
     out = frame_bgr.copy()
 
-    # Draw fills onto overlay
-    for cat, polys in polys_by_cat.items():
+    # Draw fills onto overlay (priority order — Gallbladder paints last)
+    for cat, polys in items:
         col = CAT_COLORS.get(cat, DEFAULT_COLOR)
         for poly_flat in polys:
             if len(poly_flat) < 6:
@@ -64,8 +72,8 @@ def render_frame_overlay(frame_bgr: np.ndarray,
     # Blend overlay with original for semi-transparent fill
     cv2.addWeighted(overlay, FILL_ALPHA, out, 1 - FILL_ALPHA, 0, out)
 
-    # Draw outlines (full opacity) on top
-    for cat, polys in polys_by_cat.items():
+    # Draw outlines (full opacity) on top — same priority order
+    for cat, polys in items:
         col = CAT_COLORS.get(cat, DEFAULT_COLOR)
         for poly_flat in polys:
             if len(poly_flat) < 6:
@@ -83,10 +91,12 @@ def render_frame_overlay(frame_bgr: np.ndarray,
     return out
 
 
-def process_snippet(ep: str, snip_id: str) -> dict:
-    snip_dir = SEG / ep / f"snippet_{snip_id}"
+def process_snippet(ep: str, snip_id: str, data_root: Path | None = None,
+                    no_backup: bool = False) -> dict:
+    base = data_root if data_root is not None else SEG
+    snip_dir = base / ep / f"snippet_{snip_id}"
     if not snip_dir.is_dir():
-        return {"status": "skip", "reason": "missing dir"}
+        return {"status": "skip", "reason": f"missing dir: {snip_dir}"}
 
     ann_path = snip_dir / "snippet_annotations.json"
     if not ann_path.exists():
@@ -98,16 +108,21 @@ def process_snippet(ep: str, snip_id: str) -> dict:
 
     overlays_dir = snip_dir / "overlays"
     if overlays_dir.exists() and any(overlays_dir.glob("frame_*.jpg")):
-        # Backup before re-render
-        bak = snip_dir / "overlays.bak_pre_render"
-        if not bak.exists():
-            shutil.move(str(overlays_dir), str(bak))
-            print(f"  backed up existing overlays/ -> overlays.bak_pre_render/")
+        if no_backup:
+            # Delete in place, no backup
+            for f in overlays_dir.glob("frame_*.jpg"):
+                f.unlink()
+        else:
+            bak = snip_dir / "overlays.bak_pre_render"
+            if not bak.exists():
+                shutil.move(str(overlays_dir), str(bak))
+                print(f"  backed up existing overlays/ -> overlays.bak_pre_render/")
     overlays_dir.mkdir(exist_ok=True)
 
     with open(ann_path) as f:
         ann = json.load(f)
     cat_by_id = {c["id"]: c["name"] for c in ann.get("categories", [])}
+    has_tool_in_gt = any(c.get("name") == "Tool" for c in ann.get("categories", []))
 
     # Index annotations by frame_num (= image_id)
     by_frame: dict[int, dict[str, list[list[float]]]] = {}
@@ -122,6 +137,29 @@ def process_snippet(ep: str, snip_id: str) -> dict:
         if not polys:
             continue
         by_frame.setdefault(a["image_id"], {}).setdefault(cat_name, []).extend(polys)
+
+    # If Tool isn't already merged into snippet_annotations.json, layer it in
+    # from annotated_masks.json so overlays/ always shows the combined view.
+    tool_path = snip_dir / "annotated_masks.json"
+    if not has_tool_in_gt and tool_path.exists():
+        try:
+            with open(tool_path) as f:
+                tool_doc = json.load(f)
+            t_cat_by_id = {c["id"]: c["name"] for c in tool_doc.get("categories", [])}
+            for a in tool_doc.get("annotations", []):
+                cat_name = t_cat_by_id.get(a.get("category_id"))
+                if cat_name != "Tool":
+                    continue
+                seg = a.get("segmentation") or []
+                if not isinstance(seg, list):
+                    continue
+                polys = [p for p in seg if isinstance(p, list) and len(p) >= 6]
+                if not polys:
+                    continue
+                by_frame.setdefault(a["image_id"], {}).setdefault("Tool", []).extend(polys)
+            print(f"  layered Tool from annotated_masks.json")
+        except Exception as e:
+            print(f"  WARN: could not load annotated_masks.json: {e}")
 
     n_written = 0
     n_skipped = 0
@@ -174,7 +212,13 @@ def main():
     ap.add_argument("--snippet", action="append", default=[])
     ap.add_argument("--all-missing", action="store_true",
                     help="render only snippets that have a snippet_annotations.json but no overlays/")
+    ap.add_argument("--data-dir", default=None,
+                    help="override default data/Segments root (e.g. for downloaded copies)")
+    ap.add_argument("--no-backup", action="store_true",
+                    help="overwrite overlays/ without creating overlays.bak_pre_render/")
     args = ap.parse_args()
+
+    data_root = Path(args.data_dir) if args.data_dir else None
 
     targets: list[tuple[str, str]] = []
     if args.all_missing:
@@ -197,7 +241,7 @@ def main():
 
     for ep, sid in targets:
         print(f"== {ep}/snippet_{sid} ==")
-        info = process_snippet(ep, sid)
+        info = process_snippet(ep, sid, data_root=data_root, no_backup=args.no_backup)
         if info["status"] == "ok":
             print(f"  wrote {info['frames_written']} overlays "
                   f"(GT in {info['anns_by_frame']} frames) "

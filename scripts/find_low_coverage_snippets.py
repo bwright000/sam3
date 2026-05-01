@@ -36,6 +36,9 @@ def main():
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--threshold", type=float, default=98.0,
                     help="match-expected percentage cutoff; below this is flagged")
+    ap.add_argument("--zero-frame-threshold", type=float, default=10.0,
+                    help="for variable-count snippets (expected=null), flag when "
+                         "zero-tool frame percentage exceeds this cutoff (default 10%%)")
     ap.add_argument("--stats-suffix", default="",
                     help="e.g. '.lowthresh' to look at Pass 2 stats files")
     ap.add_argument("--verbose", action="store_true")
@@ -66,23 +69,33 @@ def main():
 
     flagged = []
     if args.verbose:
-        print(f"{'snippet':<14} {'expected':<10} {'match%':<8} {'hist'}")
-        print("-" * 60)
+        print(f"{'snippet':<14} {'expected':<10} {'match%':<8} {'zero%':<8} {'reason':<14} {'hist'}")
+        print("-" * 80)
     for r in rows:
-        is_flagged = (r["expected"] is not None
+        hist = r["histogram"] or {}
+        n_zero = int(hist.get("0", 0))
+        total = r["frames"] or sum(int(v) for v in hist.values()) or 1
+        zero_pct = 100.0 * n_zero / total
+
+        flag_match = (r["expected"] is not None
                       and r["match_pct"] is not None
                       and r["match_pct"] < args.threshold)
+        flag_zero = (r["expected"] is None
+                     and zero_pct > args.zero_frame_threshold)
+        is_flagged = flag_match or flag_zero
+        reason = "low-match" if flag_match else ("high-zero" if flag_zero else "")
         marker = "FLAG" if is_flagged else "ok  "
         if is_flagged:
             flagged.append(r["key"])
         if args.verbose:
             exp = r["expected"] if r["expected"] is not None else "var"
             mp = f"{r['match_pct']:.1f}%" if r["match_pct"] is not None else "-"
-            hist = r["histogram"] or {}
-            print(f"  {marker} {r['key']:<14} {str(exp):<10} {mp:<8} {hist}")
+            zp = f"{zero_pct:.1f}%"
+            print(f"  {marker} {r['key']:<14} {str(exp):<10} {mp:<8} {zp:<8} {reason:<14} {hist}")
 
     if args.verbose:
-        print(f"\n{len(flagged)} of {len(rows)} snippets flagged for Pass 2 (< {args.threshold}%)")
+        print(f"\n{len(flagged)} of {len(rows)} snippets flagged "
+              f"(match%<{args.threshold} OR zero%>{args.zero_frame_threshold} for variable)")
     else:
         for k in flagged:
             print(k)
