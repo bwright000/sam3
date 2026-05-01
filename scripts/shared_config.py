@@ -46,7 +46,7 @@ CATEGORY_COLORS_BGR = {
 }
 DEFAULT_COLOR_BGR = (0, 255, 255)  # Yellow
 
-# Lowercase keys for pipeline scripts (generate_split_video, generate_tool_masks)
+# Lowercase keys for pipeline scripts (generate_tool_masks*, batch_text_propagate)
 CATEGORY_COLORS_BGR_LOWER = {k.lower(): v for k, v in CATEGORY_COLORS_BGR.items()}
 DEFAULT_COLOR_BGR_LOWER = DEFAULT_COLOR_BGR
 

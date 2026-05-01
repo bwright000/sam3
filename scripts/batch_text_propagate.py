@@ -8,9 +8,10 @@ For each snippet:
   4. Union all detected tool masks per frame into a single Tool mask
   5. Write annotated_masks.json (same format as the new annotator's Export)
 
-Designed to run headlessly while the interactive annotator is being debugged.
-After this finishes, run `scripts/merge_tool_masks.py` to merge into
-snippet_annotations.json.
+Designed to run headlessly. After this finishes, follow the auto gap-fill
+pipeline (`scripts/run_auto_gapfill_pipeline.sh prepare` -> Colab
+`propagate_gap_fill.py` -> `... finalize` -> `... promote`) to repair gaps
+and inject Tool annotations into production snippet_annotations.json.
 
 Usage:
     python scripts/batch_text_propagate.py \\

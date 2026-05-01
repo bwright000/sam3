@@ -140,16 +140,32 @@ Per snippet: ~3-7 keyframes × 30s + propagation runs + scrub. ~15-30 min/snippe
 
 ---
 
-## After all snippets — merge into snippet_annotations.json
+## After all snippets — auto gap-fill + promote pipeline
 
-In the VSCode terminal:
+The legacy `merge_tool_masks.py` is gone. Use the auto gap-fill pipeline:
+
 ```bash
-cd /content/sam3
-python scripts/merge_tool_masks.py \
-    --segments-dir '/content/drive/MyDrive/Datasets/CRCD/To Be Annotated'
+# On the laptop — build manifest + extract anchor seed PNGs (purely local).
+bash scripts/run_auto_gapfill_pipeline.sh prepare
+
+# On Colab A100 — run SAM3 propagation seeded from each anchor.
+python scripts/propagate_gap_fill.py \
+    --manifest /content/outputs/gap_manifest.json \
+    --anchors-dir /content/outputs/anchors \
+    --data-dir '/content/drive/MyDrive/Datasets/CRCD/To Be Annotated'
+
+# Back on the laptop — merge gap-fill into canonical, dry-run promotion,
+# build review queue.
+bash scripts/run_auto_gapfill_pipeline.sh finalize
+
+# Apply promotion when dry-run looks clean.
+bash scripts/run_auto_gapfill_pipeline.sh promote
 ```
 
-Appends Tool category from `annotated_masks.json` into each `snippet_annotations.json`. Backups saved as `*.bak_pre_tool`.
+Stage 5 (`promote_tbd_to_production.py`) injects Tool category into each
+production `snippet_annotations.json` and rasterises the polygons into
+`semantic_instance/` while preserving Liver/Gallbladder priority. Backups
+are saved as `snippet_annotations.json.bak_pre_tool_promote`.
 
 ---
 
