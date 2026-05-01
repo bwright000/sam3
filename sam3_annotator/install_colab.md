@@ -73,18 +73,21 @@ cd sam3
 
 ### B3 — Install
 ```bash
-# Use absolute paths to avoid cwd confusion
-pip install -q -e /content/sam3/sam3
+# pyproject.toml lives at the repo root (not in the inner sam3/ dir).
+# This installs the sam3 package + pulls iopath, timm, opencv-python, etc.
+pip install -q -e /content/sam3
+# Annotator only needed if you want the FastAPI UI; gap-fill alone doesn't.
 pip install -q -e /content/sam3/sam3_annotator
 ```
 (numpy<2 dependency warnings about jax/cupy/rasterio etc. are safe to ignore — we don't use those packages.)
 
 ### B4 — HuggingFace auth (only first session — token persists in cached dir)
 ```bash
+# `huggingface-cli` is deprecated; use `hf` (already pre-installed on Colab).
 ls /root/.cache/huggingface/token >/dev/null 2>&1 \
   && echo "HF token already cached" \
-  || huggingface-cli login   # paste token from https://huggingface.co/settings/tokens
-                              # token must have read access to facebook/sam3
+  || hf auth login   # paste token from https://huggingface.co/settings/tokens
+                     # token must have read access to facebook/sam3
 ```
 
 ### B5 — Launch annotator server
@@ -254,7 +257,7 @@ Once Drive + HF cache are set up, the VSCode-terminal sequence collapses to:
 ```bash
 ln -sfn /content/drive/MyDrive/Datasets/CRCD/hf_cache /root/.cache/huggingface
 cd /content && rm -rf sam3 && git clone https://github.com/bwright000/sam3.git && cd sam3
-pip install -q -e ./sam3 -e ./sam3_annotator
+pip install -q -e . -e ./sam3_annotator
 nohup python -u -m sam3_annotator.server \
     --data-dir '/content/drive/MyDrive/Datasets/CRCD/To Be Annotated' \
     --port 7860 > /content/sam3_annot.log 2>&1 &
