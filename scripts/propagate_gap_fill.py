@@ -87,31 +87,52 @@ def load_seed_mask_png(path, target_h, target_w):
 
 
 def collect_seeds_for_snippet(anchor_index, ep, snippet_name):
-    """Return [{anchor_idx, png_path, kind, gap_range}] for matching entry."""
+    """Return [{anchor_idx, polysrc_idx, png, kind, gaps_covered}] for the
+    matching snippet, **deduplicated** by (anchor_idx, polysrc_idx).
+
+    Multiple gap runs frequently share the same closest healthy neighbour
+    (e.g. three gaps in E_3/snippet_003 all use frame 62 as polygon source).
+    Adding three identical seeds to SAM3 creates three redundant obj_id
+    tracks that propagate to identical masks but pollute the per-frame
+    count metric and waste compute. We collapse them up front and record
+    every gap range each unique seed is intended to cover.
+    """
+    raw = []
     for s in anchor_index.get("snippets", []):
         if s["ep"] == ep and s["snippet"] == snippet_name:
-            seeds = []
             for seed in s["seeds"]:
                 if seed.get("status") != "ok":
                     continue
                 if seed.get("kind") == "full_rerun_seed":
-                    seeds.append({
+                    raw.append({
                         "kind": "full_rerun_seed",
                         "anchor_idx": seed["snip_idx"],
+                        "polysrc_idx": seed["snip_idx"],
                         "png": seed["out"],
                         "gap_start": None,
                         "gap_end": None,
                     })
                 else:
-                    seeds.append({
+                    raw.append({
                         "kind": "gap_seed",
                         "anchor_idx": seed["anchor_idx"],
+                        "polysrc_idx": seed.get("polygon_source_idx"),
                         "png": seed["out"],
                         "gap_start": seed["snip_idx_start"],
                         "gap_end": seed["snip_idx_end"],
                     })
-            return seeds
-    return []
+            break
+
+    by_key = {}
+    for r in raw:
+        key = (r["anchor_idx"], r["polysrc_idx"])
+        gap = (r.get("gap_start"), r.get("gap_end"))
+        if key in by_key:
+            by_key[key]["gaps_covered"].append(gap)
+        else:
+            r["gaps_covered"] = [gap]
+            by_key[key] = r
+    return list(by_key.values())
 
 
 def process_snippet(predictor, snip_dir, seeds, output_suffix, expected_tools,
@@ -142,7 +163,8 @@ def process_snippet(predictor, snip_dir, seeds, output_suffix, expected_tools,
     state = tracker.init_state(video_height=video_h, video_width=video_w, num_frames=n)
     state["images"] = images
 
-    # Add seeds
+    # Add seeds (already deduped by collect_seeds_for_snippet)
+    print(f"  {len(seeds)} unique seed(s) after dedup")
     seed_specs = []
     for i, seed in enumerate(seeds):
         obj_id = i + 1
@@ -163,8 +185,10 @@ def process_snippet(predictor, snip_dir, seeds, output_suffix, expected_tools,
                 mask=mask_t,
             )
             seed_specs.append({**seed, "obj_id": obj_id})
+            covers = seed.get("gaps_covered") or []
             print(f"    + seed obj_id={obj_id} frame_idx={frame_idx} "
-                  f"(area={int(mask.sum())})")
+                  f"polysrc={seed.get('polysrc_idx')} "
+                  f"area={int(mask.sum())} covers_gaps={covers}")
         except Exception as e:
             print(f"    seed {i}: add_new_mask failed: {e}")
             traceback.print_exc()
@@ -259,10 +283,19 @@ def process_snippet(predictor, snip_dir, seeds, output_suffix, expected_tools,
     with open(out_path, "w") as f:
         json.dump(out, f)
 
-    # Build per-frame count and stats
+    # Build per-frame count and stats. Count is the number of disconnected
+    # polygon components in the unioned per-frame mask -- the same semantic
+    # batch_text_propagate uses, so .gapfill stats are directly comparable
+    # to canonical stats. (Counting obj_ids instead would over-report on
+    # duplicate-seed snippets even after the dedup above, because SAM3 may
+    # spawn parallel tracks of the same physical tool.)
     counts = {}
     for fidx in range(n):
-        counts[fidx] = sum(per_frame_per_seed_count.get(fidx, {}).values())
+        if fidx in per_frame_union:
+            polys_for_count = mask_to_coco_polygons(per_frame_union[fidx], min_area=50)
+            counts[fidx] = len(polys_for_count)
+        else:
+            counts[fidx] = 0
     from collections import Counter
     hist = Counter(counts.values())
     n_zero = hist.get(0, 0)
