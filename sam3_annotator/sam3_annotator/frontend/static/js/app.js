@@ -331,6 +331,8 @@ function onPointerDown(e) {
   if (!pos) return;
 
   if (S.activeTool === 'brush' || S.activeTool === 'eraser') {
+    // Snapshot pre-stroke for unified undo
+    pushEditLayerUndo(S.activeTool);
     painting = true;
     lastPos = pos;
     currentStroke = new Konva.Line({
@@ -344,6 +346,10 @@ function onPointerDown(e) {
     });
     editLayer.add(currentStroke);
     editLayer.batchDraw();
+  } else if (S.activeTool === 'fill') {
+    if (!S.activeCategory) { setStatus('pick an active category before filling'); return; }
+    const op = stageToOriginal(pos);
+    bucketFill(Math.round(op.x), Math.round(op.y));
   } else if (S.activeTool === 'sam-click') {
     const op = stageToOriginal(pos);
     const label = parseInt($('#point-label').value);
@@ -392,19 +398,207 @@ function onPointerMove(e) {
 function onPointerUp(e) {
   if (painting) {
     painting = false;
-    S.undoStack.push({ type: 'stroke', node: currentStroke });
+    // Pre-stroke snapshot was pushed in onPointerDown; nothing to record here.
     currentStroke = null;
   }
 }
 
+// ---------- Edit-layer snapshot helper (used by undo + bucket fill) ----------
+// Captures the current edit layer to a fresh canvas at original image
+// resolution. Used to push a "before" snapshot onto the undo stack prior to
+// any destructive operation.
+function snapshotEditLayer() {
+  const W = S.width, H = S.height;
+  const cvs = document.createElement('canvas');
+  cvs.width = W; cvs.height = H;
+  const editCanvas = editLayer.toCanvas({ width: stage.width(), height: stage.height(), pixelRatio: 1 });
+  cvs.getContext('2d').drawImage(editCanvas, 0, 0, W, H);
+  return cvs;
+}
+
+const UNDO_LIMIT_FRAME = 30;
+function pushEditLayerUndo(label) {
+  // Capture the edit layer state *before* a mutation, push to the per-frame
+  // undo stack. Caller mutates afterwards. Cap the stack to avoid unbounded
+  // memory growth during long edit sessions on a single frame.
+  if (!stage || !S.snippet) return;
+  S.undoStack.push({ type: 'raster', canvas: snapshotEditLayer(), label: label || 'edit' });
+  while (S.undoStack.length > UNDO_LIMIT_FRAME) S.undoStack.shift();
+}
+
+// ---------- Bucket fill ----------
+// Flood-fill the empty region around (seedX, seedY) on the edit layer with
+// the active category color. Operates at original image resolution so the
+// fill is committed at full fidelity.
+//
+// Boundary threshold: the brush is drawn at opacity 0.7 (core alpha ~178)
+// with antialiased edges. A low threshold (e.g. 20) catches the outer AA
+// pixels and leaves a 1-2px gap between the fill and the visible stroke
+// centre. Setting the threshold above the AA range (alpha >= 130) treats
+// only the opaque stroke core as boundary, so the fill spreads into the
+// soft edge and eliminates the gap.
+const FILL_ALPHA_BOUNDARY = 130;
+const FILL_OUTPUT_ALPHA = 220;
+
+// Cross-category boundary helper.
+// Returns a Uint8Array of length W*H whose value is 1 where any *other*
+// category's mask has alpha above the boundary threshold (so the fill
+// treats them as walls), 0 otherwise. Walks S.gt polygons + S.approved /
+// S.propagated RLEs and renders them onto a single off-screen canvas at
+// original image resolution.
+function buildOtherCategoryBoundary(activeCategory) {
+  const W = S.width, H = S.height;
+  const cvs = document.createElement('canvas');
+  cvs.width = W; cvs.height = H;
+  const ctx = cvs.getContext('2d');
+  ctx.fillStyle = 'rgba(255,255,255,1)';
+  ctx.strokeStyle = 'rgba(255,255,255,1)';
+  ctx.lineWidth = 2;
+
+  // GT polygons (already in original image coords, not display-scaled)
+  for (const [cat, polys] of Object.entries(S.gt || {})) {
+    if (cat === activeCategory) continue;
+    for (const flat of polys) {
+      if (!flat || flat.length < 6) continue;
+      ctx.beginPath();
+      for (let i = 0; i < flat.length; i += 2) {
+        const x = flat[i], y = flat[i + 1];
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+
+  // Approved + propagated RLE masks for non-active categories
+  const stampRle = (rle) => {
+    try {
+      const id = decodeRLE(rle);  // ImageData with white-on-transparent
+      const t = document.createElement('canvas');
+      t.width = id.width; t.height = id.height;
+      t.getContext('2d').putImageData(id, 0, 0);
+      ctx.drawImage(t, 0, 0, W, H);
+    } catch (e) {
+      console.warn('boundary RLE decode failed', e);
+    }
+  };
+  for (const [cat, rle] of Object.entries(S.approved || {})) {
+    if (cat === activeCategory) continue;
+    stampRle(rle);
+  }
+  for (const [cat, rle] of Object.entries(S.propagated || {})) {
+    if (cat === activeCategory) continue;
+    stampRle(rle);
+  }
+
+  const od = ctx.getImageData(0, 0, W, H).data;
+  const wall = new Uint8Array(W * H);
+  for (let i = 0; i < W * H; i++) {
+    if (od[i * 4 + 3] > FILL_ALPHA_BOUNDARY) wall[i] = 1;
+  }
+  return wall;
+}
+
+function bucketFill(seedX, seedY) {
+  const W = S.width, H = S.height;
+  if (seedX < 0 || seedX >= W || seedY < 0 || seedY >= H) return;
+
+  // Render the current edit layer at original resolution for hit-testing
+  const tmp = snapshotEditLayer();
+  const tctx = tmp.getContext('2d');
+  const imgData = tctx.getImageData(0, 0, W, H);
+  const d = imgData.data;
+
+  // Other-category masks (GT polygons + approved/propagated RLEs) act as
+  // additional walls so a fill respects neighbouring tissue/tool boundaries
+  // even when the user's own strokes don't fully enclose the region.
+  const otherWall = buildOtherCategoryBoundary(S.activeCategory);
+
+  const seedLin = seedY * W + seedX;
+  const seedI = seedLin * 4;
+  if (d[seedI + 3] > FILL_ALPHA_BOUNDARY) {
+    setStatus('fill: seed is on a painted pixel — click inside an empty region');
+    return;
+  }
+  if (otherWall[seedLin]) {
+    setStatus('fill: seed is on a neighbouring mask (' +
+              'click inside an empty region between boundaries)');
+    return;
+  }
+
+  // Push pre-fill snapshot for undo
+  pushEditLayerUndo('fill');
+
+  // 4-connected BFS, alpha-thresholded against (edit-layer OR other-cat masks)
+  const visited = new Uint8Array(W * H);
+  const queue = new Int32Array(W * H);
+  let head = 0, tail = 0;
+  queue[tail++] = seedLin;
+  visited[seedLin] = 2;  // 2 = filled
+  let filled = 0;
+
+  const isWall = (ni) => d[ni * 4 + 3] > FILL_ALPHA_BOUNDARY || otherWall[ni];
+
+  while (head < tail) {
+    const lin = queue[head++];
+    filled++;
+    const x = lin % W, y = (lin - x) / W;
+    if (x + 1 < W) { const ni = lin + 1; if (!visited[ni]) { if (isWall(ni)) visited[ni] = 1; else { visited[ni] = 2; queue[tail++] = ni; } } }
+    if (x - 1 >= 0) { const ni = lin - 1; if (!visited[ni]) { if (isWall(ni)) visited[ni] = 1; else { visited[ni] = 2; queue[tail++] = ni; } } }
+    if (y + 1 < H) { const ni = lin + W; if (!visited[ni]) { if (isWall(ni)) visited[ni] = 1; else { visited[ni] = 2; queue[tail++] = ni; } } }
+    if (y - 1 >= 0) { const ni = lin - W; if (!visited[ni]) { if (isWall(ni)) visited[ni] = 1; else { visited[ni] = 2; queue[tail++] = ni; } } }
+  }
+
+  // Safety: if the fill flooded > 90% of the canvas, the seed wasn't enclosed.
+  // Prompt for confirmation before committing — common cause of "wrecked everything".
+  const pct = (100 * filled) / (W * H);
+  if (pct > 90) {
+    if (!confirm(`Fill flooded ${pct.toFixed(0)}% of the frame — your boundary likely isn't closed. Apply anyway?`)) {
+      setStatus('fill cancelled (boundary not closed)');
+      return;
+    }
+  }
+
+  // Paint filled pixels with active category color
+  const col = hexToRgb(catColor(S.activeCategory));
+  for (let i = 0; i < W * H; i++) {
+    if (visited[i] === 2) {
+      const di = i * 4;
+      d[di] = col.r; d[di + 1] = col.g; d[di + 2] = col.b;
+      d[di + 3] = FILL_OUTPUT_ALPHA;
+    }
+  }
+  tctx.putImageData(imgData, 0, 0);
+
+  // Replace the edit layer with the filled raster (collapses prior strokes
+  // into a single Konva.Image — that's fine; commit threshold is unchanged).
+  editLayer.destroyChildren();
+  editLayer.add(new Konva.Image({
+    image: tmp,
+    width: stage.width(),
+    height: stage.height(),
+  }));
+  editLayer.batchDraw();
+  S.undoStack.push({ type: 'raster', canvas: undoCanvas });
+  setStatus(`fill: +${filled}px (${pct.toFixed(1)}% of frame)`);
+}
+
 // ---------- Undo ----------
+// Unified raster-snapshot undo. Every mutating op on the edit layer
+// (brush stroke, eraser stroke, bucket fill, SAM3 preview, accept-text,
+// load-GT-as-editable, clear-edit-layer) calls pushEditLayerUndo() with
+// a "before" snapshot. Undo restores the most recent one.
 function undo() {
   const last = S.undoStack.pop();
-  if (!last) return;
-  if (last.type === 'stroke' && last.node) {
-    last.node.destroy();
-    editLayer.batchDraw();
-  }
+  if (!last || last.type !== 'raster' || !last.canvas) return;
+  editLayer.destroyChildren();
+  editLayer.add(new Konva.Image({
+    image: last.canvas,
+    width: stage.width(),
+    height: stage.height(),
+  }));
+  editLayer.batchDraw();
 }
 
 // ---------- Commit: edit layer → PNG → POST ----------
@@ -487,6 +681,7 @@ async function previewSAM() {
     cvs.width = imgData.width;
     cvs.height = imgData.height;
     cvs.getContext('2d').putImageData(imgData, 0, 0);
+    pushEditLayerUndo('sam-preview');
     editLayer.destroyChildren();
     editLayer.add(new Konva.Image({
       image: cvs,
@@ -636,6 +831,7 @@ function acceptSelectedTextDets() {
   const cvs = document.createElement('canvas');
   cvs.width = W; cvs.height = H;
   cvs.getContext('2d').putImageData(imgData, 0, 0);
+  pushEditLayerUndo('accept-text');
   editLayer.destroyChildren();
   editLayer.add(new Konva.Image({
     image: cvs, width: stage.width(), height: stage.height(),
@@ -695,6 +891,7 @@ async function loadGTEditable() {
   // Rasterize polygon to a single Konva.Image so brush+eraser fully edit it
   // (Konva.Line is a vector primitive; its stroke pixels are redrawn each frame
   //  and would persist through eraser strokes. A raster image is fully editable.)
+  pushEditLayerUndo('load-gt');
   editLayer.destroyChildren();
   const W = S.width, H = S.height;
   const cvs = document.createElement('canvas');
@@ -1108,15 +1305,18 @@ function bindEvents() {
   $('#preview-btn').onclick = previewSAM;
   $('#commit-btn').onclick = commitAnchor;
   $('#clear-btn').onclick = () => {
+    // Snapshot pre-clear so undo can restore the cleared edit layer
+    pushEditLayerUndo('clear-edit');
     editLayer.destroyChildren();
     editLayer.batchDraw();
     promptLayer.destroyChildren();
     S.samPoints = []; S.samBox = null; S.samBoxFirstClick = null;
     promptLayer.batchDraw();
-    S.undoStack = [];
+    // Note: undoStack is intentionally NOT cleared — we just pushed the
+    // pre-clear snapshot, so Ctrl+Z still restores it.
     S.editingGT.clear();
     renderOverlays();
-    setStatus('edit layer cleared');
+    setStatus('edit layer cleared (Ctrl+Z to undo)');
   };
   $('#load-gt-btn').onclick = loadGTEditable;
 
@@ -1141,6 +1341,7 @@ function bindEvents() {
     if (document.activeElement && ['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)) return;
     if (e.key === 'b') selectTool('brush');
     else if (e.key === 'e') selectTool('eraser');
+    else if (e.key === 'f') selectTool('fill');
     else if (e.key === 's' && !e.shiftKey) selectTool('sam-click');
     else if (e.key === 'S' && e.shiftKey) selectTool('sam-box');
     else if (e.key === 't') selectTool('sam-text');
