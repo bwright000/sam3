@@ -821,12 +821,17 @@ def _autosave():
     if STATE.snippet is None:
         return
     from .rle import mask_to_polygons
+    # epsilon_max_px=2 caps Douglas-Peucker simplification at 2 pixels per
+    # vertex regardless of contour perimeter, so large tissue masks aren't
+    # simplified into blocky polygons (which then re-rasterise as crude shapes
+    # on reload). This makes the autosave round-trip near-lossless at the
+    # cost of slightly larger JSON.
     approved = {}
     for fidx, cats in STATE.approved.items():
         approved[str(fidx)] = {}
         for cat, m in cats.items():
             approved[str(fidx)][cat] = {
-                "polygons": mask_to_polygons(m, min_area=10),
+                "polygons": mask_to_polygons(m, min_area=10, epsilon_max_px=2),
                 "area": int(m.sum()),
             }
     propagated = {}
@@ -834,7 +839,7 @@ def _autosave():
         propagated[str(fidx)] = {}
         for cat, m in cats.items():
             propagated[str(fidx)][cat] = {
-                "polygons": mask_to_polygons(m, min_area=10),
+                "polygons": mask_to_polygons(m, min_area=10, epsilon_max_px=2),
                 "area": int(m.sum()),
             }
     state = {

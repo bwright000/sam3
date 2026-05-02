@@ -66,10 +66,21 @@ def load_snippet(episode: str, snippet_id: str) -> SnippetInfo:
 
     Tries frame directories in priority order (`frames_left/`, then `rgb/`)
     so both legacy CRCD-master and new TUM-style cluster snippets work.
+
+    Snippet dir name is normally `snippet_{id}/`. Falls back to
+    `snippet_{id} tbd/` (the gap-fill staging convention) so the annotator
+    can edit tbd snippets in place without renaming.
     """
-    root = data_dir() / episode / f"snippet_{snippet_id}"
+    base = data_dir() / episode
+    root = base / f"snippet_{snippet_id}"
     if not root.is_dir():
-        raise FileNotFoundError(f"snippet dir not found: {root}")
+        tbd = base / f"snippet_{snippet_id} tbd"
+        if tbd.is_dir():
+            root = tbd
+        else:
+            raise FileNotFoundError(
+                f"snippet dir not found: {root} (also tried {tbd})"
+            )
 
     frames_dir = None
     frame_files: list[Path] = []

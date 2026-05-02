@@ -25,10 +25,22 @@ def rle_to_mask(rle: dict[str, Any]) -> np.ndarray:
     return coco_mask.decode(r).astype(np.uint8)
 
 
-def mask_to_polygons(mask: np.ndarray, min_area: int = 50, epsilon_frac: float = 0.002) -> list[list[float]]:
+def mask_to_polygons(mask: np.ndarray, min_area: int = 50,
+                     epsilon_frac: float = 0.002,
+                     epsilon_max_px: float | None = 2.0) -> list[list[float]]:
     """Binary mask -> list of COCO-format flat polygons [x,y,x,y,...].
 
-    epsilon_frac controls Douglas-Peucker simplification (as fraction of contour arclength).
+    epsilon_frac controls Douglas-Peucker simplification (as fraction of contour
+    arclength). For large-perimeter masks (e.g. tissue regions covering most of
+    the frame) the raw 0.002 fraction produces aggressive smoothing — a
+    10k-perim contour would get eps=20, leaving 8-vertex blobs that bear little
+    resemblance to the original.
+
+    `epsilon_max_px` clamps the absolute simplification error in pixels. The
+    default of 2.0 is near-lossless visually (sub-pixel-pair detail is
+    preserved). Pass a larger value (e.g. 5-10) only if you need a smaller
+    polygon for storage or rendering at small scales, AND your downstream is
+    tolerant of the simplification. Pass None to opt out entirely.
     """
     import cv2
     if mask.dtype != np.uint8:
@@ -40,6 +52,8 @@ def mask_to_polygons(mask: np.ndarray, min_area: int = 50, epsilon_frac: float =
             continue
         perim = cv2.arcLength(cnt, True)
         eps = max(1.0, epsilon_frac * perim)
+        if epsilon_max_px is not None:
+            eps = min(eps, epsilon_max_px)
         approx = cv2.approxPolyDP(cnt, eps, True)
         if len(approx) < 3:
             continue
