@@ -48,6 +48,11 @@ const S = {
   // Categories whose GT is currently loaded onto the edit layer (so we hide
   // the dashed GT outline for those — otherwise it looks un-erasable).
   editingGT: new Set(),
+  // Categories whose APPROVED mask is currently loaded onto the edit layer
+  // for in-place refinement (eraser strokes should *shrink* the approved
+  // mask). On commit, these categories REPLACE the existing approved mask
+  // instead of unioning with it. Cleared per-frame and per-commit.
+  editingApproved: new Set(),
   // undo stack: array of {type, payload}
   undoStack: [],
 };
@@ -174,6 +179,7 @@ async function loadFrame(idx) {
   S.samBox = null;
   S.samBoxFirstClick = null;
   S.editingGT.clear();
+  S.editingApproved.clear();
   editLayer.batchDraw();
   promptLayer.batchDraw();
   S.undoStack = [];
@@ -570,25 +576,34 @@ function bucketFill(seedX, seedY) {
     }
   }
 
-  // Paint filled pixels with active category color
+  // Build a *fill-only* canvas: transparent everywhere except newly-flooded
+  // pixels, painted in the active category's color. Critical that this NOT
+  // contain pre-existing other-category strokes — they're tagged separately
+  // on the layer and must not be baked into a single tagged image (otherwise
+  // commit would attribute them to the wrong category).
   const col = hexToRgb(catColor(S.activeCategory));
+  const fillOnly = document.createElement('canvas');
+  fillOnly.width = W; fillOnly.height = H;
+  const foCtx = fillOnly.getContext('2d');
+  const foData = foCtx.createImageData(W, H);
+  const fd = foData.data;
   for (let i = 0; i < W * H; i++) {
     if (visited[i] === 2) {
       const di = i * 4;
-      d[di] = col.r; d[di + 1] = col.g; d[di + 2] = col.b;
-      d[di + 3] = FILL_OUTPUT_ALPHA;
+      fd[di] = col.r; fd[di + 1] = col.g; fd[di + 2] = col.b;
+      fd[di + 3] = FILL_OUTPUT_ALPHA;
     }
   }
-  tctx.putImageData(imgData, 0, 0);
+  foCtx.putImageData(foData, 0, 0);
 
-  // Replace ONLY this category's children with the filled raster -- preserve
+  // Replace ONLY this category's children with the fill-only raster — preserve
   // any other-category strokes the user has on the edit layer. (Bucket fill
   // used to nuke the entire edit layer, taking other cats' work with it.)
   const activeCat = S.activeCategory;
   const toRemove = editLayer.getChildren().filter(c => c.getAttr('cat') === activeCat);
   toRemove.forEach(c => c.destroy());
   const filledImg = new Konva.Image({
-    image: tmp,
+    image: fillOnly,
     width: stage.width(),
     height: stage.height(),
   });
@@ -596,7 +611,7 @@ function bucketFill(seedX, seedY) {
   editLayer.add(filledImg);
   editLayer.batchDraw();
   S.undoStack.push({ type: 'raster', canvas: undoCanvas });
-  setStatus(`fill: +${filled}px (${pct.toFixed(1)}% of frame)`);
+  setStatus(`fill: +${filled}px (${pct.toFixed(1)}% of frame) for ${activeCat}`);
 }
 
 // ---------- Undo ----------
@@ -617,86 +632,141 @@ function undo() {
 }
 
 // ---------- Commit: edit layer → PNG → POST ----------
-// Walks the edit-layer children, groups them by their `cat` attribute (set at
-// draw-time / fill-time / load-GT-time), and POSTs one anchor commit per
-// category so each category's strokes are saved under the correct mask --
-// not lumped into whatever the active category happens to be at commit time.
+// Renders the FULL edit layer once (Konva applies z-order + opacity, so
+// overlapping strokes resolve via source-over) then classifies each visible
+// pixel by nearest category color. This means the visible top-layer colour
+// at each pixel determines its category — no per-category isolation, no
+// double-counting under overlapping strokes. Tool brushed on top of a Liver
+// raster means those pixels go to Tool only; Liver gets only pixels where
+// Liver is actually visible. Robust against `cat` tag mismatches too.
 async function commitAnchor() {
   if (!S.snippet) { setStatus('no snippet'); return; }
-  if (!S.activeCategory) { setStatus('pick an active category'); return; }
-
-  const origW = S.width;
-  const origH = S.height;
-
-  // Group children by category. Untagged children (legacy paint or things we
-  // didn't tag) fall through under the active category as a safety net.
-  const byCat = new Map();
-  for (const child of editLayer.getChildren()) {
-    const cat = child.getAttr('cat') || S.activeCategory;
-    if (!byCat.has(cat)) byCat.set(cat, []);
-    byCat.get(cat).push(child);
-  }
-
-  if (byCat.size === 0) {
-    setStatus('nothing on edit layer to commit');
+  if (!S.categories || S.categories.length === 0) {
+    setStatus('no categories defined');
     return;
   }
 
-  // For each category, render ONLY its children on a hidden Konva layer, then
-  // export to PNG and POST. This isolates per-category strokes regardless of
-  // z-order on the edit layer. We render at display resolution then scale up.
+  const origW = S.width;
+  const origH = S.height;
   const stageW = stage.width();
   const stageH = stage.height();
 
-  setStatus(`committing ${byCat.size} categor${byCat.size === 1 ? 'y' : 'ies'}…`);
+  // Render the full composited edit layer at original resolution
+  const editCanvas = editLayer.toCanvas({ width: stageW, height: stageH, pixelRatio: 1 });
+  const tmp = document.createElement('canvas');
+  tmp.width = origW; tmp.height = origH;
+  const tctx = tmp.getContext('2d');
+  tctx.drawImage(editCanvas, 0, 0, origW, origH);
+  const imgData = tctx.getImageData(0, 0, origW, origH);
+  const d = imgData.data;
+
+  // Per-pixel nearest-color classification. Cat colors are well-separated
+  // (Tool/Liver/Gallbladder differ by hundreds in Euclidean RGB) so a single
+  // distance comparison is reliable for both pure and source-over-blended
+  // pixels.
+  const ALPHA_THRESH = 20;
+  const cats = S.categories;
+  const catRgb = cats.map(c => hexToRgb(catColor(c)));
+  const numPx = origW * origH;
+  const catMasks = cats.map(() => new Uint8Array(numPx));
+  const counts = new Array(cats.length).fill(0);
+
+  for (let p = 0; p < numPx; p++) {
+    const di = p * 4;
+    if (d[di + 3] <= ALPHA_THRESH) continue;
+    const r = d[di], g = d[di + 1], b = d[di + 2];
+    let bestK = 0, bestDist = Infinity;
+    for (let k = 0; k < cats.length; k++) {
+      const cc = catRgb[k];
+      const dr = r - cc.r, dg = g - cc.g, db = b - cc.b;
+      const dist = dr * dr + dg * dg + db * db;
+      if (dist < bestDist) { bestDist = dist; bestK = k; }
+    }
+    catMasks[bestK][p] = 1;
+    counts[bestK]++;
+  }
+
+  const present = [];
+  for (let k = 0; k < cats.length; k++) {
+    if (counts[k] > 0) present.push(k);
+  }
+  if (present.length === 0) {
+    setStatus('nothing to commit');
+    return;
+  }
+
+  setStatus(`committing ${present.length} categor${present.length === 1 ? 'y' : 'ies'}…`);
   const results = [];
   let totalPixels = 0;
 
-  for (const [cat, nodes] of byCat) {
-    const isolation = new Konva.Layer({ listening: false });
-    stage.add(isolation);
+  for (const k of present) {
+    const cat = cats[k];
+    const mask = catMasks[k];
+    // Decide commit mode:
+    //   * REPLACE if this cat was loaded as editable via "Load Approved as
+    //     Editable" — the user explicitly pulled the existing mask onto the
+    //     edit layer to refine it (so eraser strokes shrink it, etc).
+    //   * UNION otherwise — sequential commits should accumulate (paint
+    //     Tool 1, commit, paint Tool 2, commit → both kept).
+    // Backend /api/anchor/commit always replaces approved[fidx][cat]; the
+    // union (when active) happens client-side before POST.
+    const replaceMode = S.editingApproved.has(cat);
+    let unionedWithExisting = 0;
+    const existingRle = S.approved[cat];
+    if (existingRle && !replaceMode) {
+      try {
+        const ex = decodeRLE(existingRle);
+        const exData = ex.data;
+        // ex is at original image resolution by construction (server-side
+        // mask_to_rle), so pixel indices align 1:1 with our mask buffer.
+        if (ex.width === origW && ex.height === origH) {
+          for (let p = 0; p < numPx; p++) {
+            if (!mask[p] && exData[p * 4 + 3] > 0) {
+              mask[p] = 1;
+              unionedWithExisting++;
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('union with existing approved failed', cat, e);
+      }
+    }
+
+    const maskCanvas = document.createElement('canvas');
+    maskCanvas.width = origW; maskCanvas.height = origH;
+    const mctx = maskCanvas.getContext('2d');
+    const out = mctx.createImageData(origW, origH);
+    const od = out.data;
+    for (let p = 0; p < numPx; p++) {
+      if (mask[p]) {
+        const oi = p * 4;
+        od[oi] = 255; od[oi + 1] = 255; od[oi + 2] = 255; od[oi + 3] = 255;
+      }
+    }
+    mctx.putImageData(out, 0, 0);
+    const dataUrl = maskCanvas.toDataURL('image/png');
     try {
-      for (const node of nodes) isolation.add(node.clone({ listening: false }));
-      isolation.batchDraw();
-      const isolationCanvas = isolation.toCanvas({ width: stageW, height: stageH, pixelRatio: 1 });
-      const tmp = document.createElement('canvas');
-      tmp.width = origW; tmp.height = origH;
-      const tctx = tmp.getContext('2d');
-      tctx.drawImage(isolationCanvas, 0, 0, origW, origH);
-      const imgData = tctx.getImageData(0, 0, origW, origH);
-      const d = imgData.data;
-      let on = 0;
-      for (let i = 0; i < d.length; i += 4) {
-        const has = d[i + 3] > 20 ? 255 : 0;
-        d[i] = has; d[i + 1] = has; d[i + 2] = has; d[i + 3] = has;
-        if (has) on++;
-      }
-      if (on === 0) {
-        // All strokes on this cat were eraser-only -- skip it; nothing to commit
-        continue;
-      }
-      tctx.putImageData(imgData, 0, 0);
-      const dataUrl = tmp.toDataURL('image/png');
       const r = await apiPost('/api/anchor/commit', {
         frame_idx: S.frameIdx,
         category: cat,
         mask_png_b64: dataUrl,
       });
-      results.push(`${cat}=${r.pixels}px`);
+      let tag = `${cat}=${r.pixels}px`;
+      if (replaceMode) tag += ' (replaced)';
+      else if (unionedWithExisting > 0) tag += ` (+${unionedWithExisting} kept)`;
+      results.push(tag);
       totalPixels += r.pixels || 0;
+      // The replace cycle is done — drop this cat from editingApproved so
+      // subsequent paint+commit on the same cat goes back to union mode.
+      S.editingApproved.delete(cat);
     } catch (e) {
       setStatus(`commit failed for ${cat}: ${e.message}`);
-      isolation.destroy();
       return;
     }
-    isolation.destroy();
   }
 
-  if (results.length === 0) {
-    setStatus('commit: nothing to save (eraser-only edit?)');
-  } else {
-    setStatus(`committed: ${results.join(', ')} (${totalPixels}px total)`);
-  }
+  setStatus(`committed: ${results.join(', ')} (${totalPixels}px total)`);
+  const byCat = new Map(present.map(k => [cats[k], null]));
   // Refresh approved masks for this frame
   try {
     const m = await apiGet(`/api/masks/${S.frameIdx}`);
@@ -744,14 +814,20 @@ async function previewSAM() {
     cvs.height = imgData.height;
     cvs.getContext('2d').putImageData(imgData, 0, 0);
     pushEditLayerUndo('sam-preview');
-    editLayer.destroyChildren();
-    editLayer.add(new Konva.Image({
+    // Replace ONLY same-category children, preserve other categories' strokes
+    const activeCat = S.activeCategory;
+    editLayer.getChildren()
+      .filter(c => c.getAttr('cat') === activeCat)
+      .forEach(c => c.destroy());
+    const previewImg = new Konva.Image({
       image: cvs,
       width: stage.width(),
       height: stage.height(),
-    }));
+    });
+    previewImg.setAttr('cat', activeCat);
+    editLayer.add(previewImg);
     editLayer.batchDraw();
-    setStatus(`preview: ${r.pixels}px. Click Commit to keep, or erase/add brush to refine.`);
+    setStatus(`preview: ${r.pixels}px for ${activeCat}. Click Commit to keep, or erase/add brush to refine.`);
   } catch (e) {
     setStatus(`preview failed: ${e.message}`);
   }
@@ -894,10 +970,20 @@ function acceptSelectedTextDets() {
   cvs.width = W; cvs.height = H;
   cvs.getContext('2d').putImageData(imgData, 0, 0);
   pushEditLayerUndo('accept-text');
-  editLayer.destroyChildren();
-  editLayer.add(new Konva.Image({
+  // Replace ONLY same-category children + the text-detection preview
+  // images/badges; preserve other-category strokes.
+  const activeCat = S.activeCategory;
+  editLayer.getChildren().filter(c => {
+    // Drop our own active-cat work and any leftover text-detection preview nodes
+    if (c.getAttr('cat') === activeCat) return true;
+    if (c.getAttr('detIdx') !== undefined) return true;
+    return false;
+  }).forEach(c => c.destroy());
+  const acceptedImg = new Konva.Image({
     image: cvs, width: stage.width(), height: stage.height(),
-  }));
+  });
+  acceptedImg.setAttr('cat', activeCat);
+  editLayer.add(acceptedImg);
   editLayer.batchDraw();
   // Clear detection list
   S.textDets = [];
@@ -988,6 +1074,59 @@ async function loadGTEditable() {
   S.editingGT.add(S.activeCategory);
   renderOverlays();
   setStatus(`loaded ${polys.length} GT polygon(s) for ${S.activeCategory} as raster — brush/eraser fully editable. Commit when done.`);
+}
+
+// ---------- Load approved (or propagated) as editable ----------
+// Pulls the existing approved mask for the active category onto the edit
+// layer so the user can refine it (add via brush, remove via eraser, then
+// commit to replace). Use case: "I committed Tool but the mask is slightly
+// wrong — let me erase the bad part and add a correction."
+async function loadApprovedEditable() {
+  if (!S.snippet || !S.activeCategory) return;
+  const activeCat = S.activeCategory;
+  const rle = S.approved[activeCat];
+  if (!rle) {
+    setStatus(`no approved ${activeCat} mask on this frame to load`);
+    return;
+  }
+  pushEditLayerUndo('load-approved');
+  // Clear ONLY same-category children to preserve any other-cat work in progress.
+  editLayer.getChildren().filter(c => c.getAttr('cat') === activeCat)
+                  .forEach(c => c.destroy());
+
+  const W = S.width, H = S.height;
+  const cvs = document.createElement('canvas');
+  cvs.width = W; cvs.height = H;
+  const ctx = cvs.getContext('2d');
+  // Decode RLE → recolor into category color at 80% alpha
+  try {
+    const decoded = decodeRLE(rle);
+    const dd = decoded.data;
+    const col = hexToRgb(catColor(activeCat));
+    for (let i = 0; i < dd.length; i += 4) {
+      if (dd[i + 3] > 0) {
+        dd[i] = col.r; dd[i + 1] = col.g; dd[i + 2] = col.b; dd[i + 3] = 204;
+      }
+    }
+    ctx.putImageData(decoded, 0, 0);
+  } catch (e) {
+    setStatus(`load approved failed: ${e.message}`);
+    return;
+  }
+  const apprImg = new Konva.Image({
+    image: cvs,
+    width: stage.width(),
+    height: stage.height(),
+  });
+  apprImg.setAttr('cat', activeCat);
+  editLayer.add(apprImg);
+  editLayer.batchDraw();
+  // Mark this cat as in "edit-existing" mode. The next commit for this cat
+  // will REPLACE the existing approved mask (so eraser strokes shrink it,
+  // and brush additions add to it) instead of unioning. The flag clears
+  // automatically after commit, on frame change, or on Clear Edit Layer.
+  S.editingApproved.add(activeCat);
+  setStatus(`loaded approved ${activeCat} as raster — brush adds, eraser shrinks. Next commit REPLACES the existing ${activeCat} mask.`);
 }
 
 // ---------- Undo / Redo ----------
@@ -1383,10 +1522,12 @@ function bindEvents() {
     // Note: undoStack is intentionally NOT cleared — we just pushed the
     // pre-clear snapshot, so Ctrl+Z still restores it.
     S.editingGT.clear();
+    S.editingApproved.clear();
     renderOverlays();
     setStatus('edit layer cleared (Ctrl+Z to undo)');
   };
   $('#load-gt-btn').onclick = loadGTEditable;
+  $('#load-approved-btn').onclick = loadApprovedEditable;
 
   $('#prop-btn').onclick = propagate;
   $('#export-btn').onclick = exportSnippet;
@@ -1414,6 +1555,7 @@ function bindEvents() {
     else if (e.key === 'S' && e.shiftKey) selectTool('sam-box');
     else if (e.key === 't') selectTool('sam-text');
     else if (e.key === 'g') loadGTEditable();
+    else if (e.key === 'a') loadApprovedEditable();
     else if (e.key === 'Enter') { e.preventDefault(); commitAnchor(); }
     else if (e.key === ' ') {
       e.preventDefault();

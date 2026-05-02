@@ -86,16 +86,20 @@ def load_seed_mask_png(path, target_h, target_w):
     return (arr > 127).astype(np.uint8)
 
 
-def collect_seeds_for_snippet(anchor_index, ep, snippet_name):
-    """Return [{anchor_idx, polysrc_idx, png, kind, gaps_covered}] for the
-    matching snippet, **deduplicated** by (anchor_idx, polysrc_idx).
+def collect_seeds_for_snippet(anchor_index, ep, snippet_name, dedup: bool = False):
+    """Return [{anchor_idx, polysrc_idx, png, kind, gaps_covered, ...}] for the
+    matching snippet.
 
-    Multiple gap runs frequently share the same closest healthy neighbour
-    (e.g. three gaps in E_3/snippet_003 all use frame 62 as polygon source).
-    Adding three identical seeds to SAM3 creates three redundant obj_id
-    tracks that propagate to identical masks but pollute the per-frame
-    count metric and waste compute. We collapse them up front and record
-    every gap range each unique seed is intended to cover.
+    By default seeds are NOT deduplicated. Empirically (F_3/snippet_006,
+    F_3/snippet_003) registering N redundant seeds at the same (anchor,polysrc)
+    as N separate obj_ids gives SAM3's tracker N independent memory tracks
+    that union into a more robust per-frame Tool mask. Collapsing them to one
+    obj_id removes the redundancy and propagation drifts/thins below
+    `min_area`, leaving > 90% of frames empty. The "wasted compute" the
+    dedup avoids is small (~Nx forward-pass) compared to the lost recall.
+
+    Set dedup=True only if you've measured that propagation is robust
+    without redundancy on the snippets in question.
     """
     raw = []
     for s in anchor_index.get("snippets", []):
@@ -111,6 +115,7 @@ def collect_seeds_for_snippet(anchor_index, ep, snippet_name):
                         "png": seed["out"],
                         "gap_start": None,
                         "gap_end": None,
+                        "gaps_covered": [(None, None)],
                     })
                 else:
                     raw.append({
@@ -120,9 +125,14 @@ def collect_seeds_for_snippet(anchor_index, ep, snippet_name):
                         "png": seed["out"],
                         "gap_start": seed["snip_idx_start"],
                         "gap_end": seed["snip_idx_end"],
+                        "gaps_covered": [(seed["snip_idx_start"], seed["snip_idx_end"])],
                     })
             break
 
+    if not dedup:
+        return raw
+
+    # Optional dedup path (off by default — see docstring).
     by_key = {}
     for r in raw:
         key = (r["anchor_idx"], r["polysrc_idx"])
@@ -163,8 +173,10 @@ def process_snippet(predictor, snip_dir, seeds, output_suffix, expected_tools,
     state = tracker.init_state(video_height=video_h, video_width=video_w, num_frames=n)
     state["images"] = images
 
-    # Add seeds (already deduped by collect_seeds_for_snippet)
-    print(f"  {len(seeds)} unique seed(s) after dedup")
+    # Add seeds. By default each seed becomes its own obj_id (redundancy is
+    # intentional — see collect_seeds_for_snippet docstring); --dedup-seeds
+    # collapses identical (anchor,polysrc) into one obj_id.
+    print(f"  {len(seeds)} seed(s)")
     seed_specs = []
     for i, seed in enumerate(seeds):
         obj_id = i + 1
@@ -349,6 +361,14 @@ def main():
     ap.add_argument("--min-area", type=int, default=100)
     ap.add_argument("--score-threshold", type=float, default=None)
     ap.add_argument("--new-det-thresh", type=float, default=None)
+    ap.add_argument("--dedup-seeds", action="store_true",
+                    help="collapse seeds with identical (anchor_idx, polysrc_idx) "
+                         "into a single obj_id. Off by default — empirically "
+                         "the redundant obj_id tracks improve propagation "
+                         "robustness on snippets with multiple gaps sharing one "
+                         "anchor (F_3/snippet_006 regressed from useful to 0%% "
+                         "match when this was on). Use only if you've verified "
+                         "non-regression on your data.")
     args = ap.parse_args()
 
     manifest = json.load(open(args.manifest))
@@ -386,7 +406,8 @@ def main():
             print(f"\n=== {rel} ===  not a directory: {snip_dir}")
             continue
 
-        seeds = collect_seeds_for_snippet(anchor_index, ep, snippet_name)
+        seeds = collect_seeds_for_snippet(anchor_index, ep, snippet_name,
+                                            dedup=args.dedup_seeds)
         if not seeds:
             print(f"\n=== {rel} ===  no seeds in anchor_index, skipping")
             continue

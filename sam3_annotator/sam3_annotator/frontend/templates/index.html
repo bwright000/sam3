@@ -6,7 +6,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IM+Fell+English:wght@400;700&family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/css/app.css?v=0.1.0-fitvp">
+  <link rel="stylesheet" href="/static/css/app.css?v=0.1.0-replace">
   <script src="https://unpkg.com/konva@9/konva.min.js"></script>
 </head>
 <body>
@@ -98,6 +98,7 @@
         <div class="label">Tool</div>
         <button data-tool="brush" class="tool-btn active" title="Brush (B)">✏️<br>Brush</button>
         <button data-tool="eraser" class="tool-btn" title="Eraser (E)">🧽<br>Eraser</button>
+        <button data-tool="fill" class="tool-btn" title="Bucket Fill (F) — click inside an empty region enclosed by paint">🪣<br>Fill</button>
         <button data-tool="sam-click" class="tool-btn" title="SAM3 Click (S)">🎯<br>SAM Click</button>
         <button data-tool="sam-box" class="tool-btn" title="SAM3 Box (Shift+S)">📦<br>SAM Box</button>
         <button data-tool="sam-text" class="tool-btn" title="SAM3 Text (T)">🔤<br>SAM Text</button>
@@ -138,7 +139,8 @@
         <button id="preview-btn" class="btn full">Preview (SAM3)</button>
         <button id="commit-btn" class="btn primary full" title="Enter">Commit Anchor</button>
         <button id="clear-btn" class="btn full">Clear Edit Layer</button>
-        <button id="load-gt-btn" class="btn full">Load GT as Editable</button>
+        <button id="load-gt-btn" class="btn full" title="G">Load GT as Editable</button>
+        <button id="load-approved-btn" class="btn full" title="A — pull current approved mask onto edit layer to refine">Load Approved as Editable</button>
       </div>
       <div class="tool-group">
         <div class="label">Layers</div>
@@ -149,6 +151,6 @@
     </aside>
   </div>
 
-  <script src="/static/js/app.js?v=0.1.0-fitvp"></script>
+  <script src="/static/js/app.js?v=0.1.0-replace"></script>
 </body>
 </html>
