@@ -10,7 +10,7 @@
 
 set -e
 
-LOCAL_SRC="${1:-c:/Users/benli/sam3facebook/data/Segments}"
+LOCAL_SRC="${1:-F:/Datasets/CRCD}"
 DRIVE_DST="${2:-G:/My Drive/Datasets/CRCD}"
 TAR_NAME="snippets.tar"
 

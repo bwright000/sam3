@@ -214,7 +214,7 @@ This step also runs Stage 5 (`promote_tbd_to_production.py`) in
 ### G5 — Sync Drive back to local laptop, then promote
 The merged outputs live alongside each tbd snippet on Drive. Drive
 desktop autosyncs to the local laptop. On the laptop (production lives
-only there at `c:/Users/benli/sam3facebook/data/Segments/`):
+at `F:/Datasets/CRCD/`):
 
 ```bash
 # In a local terminal:

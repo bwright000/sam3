@@ -170,7 +170,7 @@ def test_snippet(snippet_dir):
 
 
 def main():
-    ROOT = Path('c:/Users/benli/sam3facebook/data/Segments')
+    ROOT = Path('F:/Datasets/CRCD')
     total = 0
     failed = 0
     for ep in ['C_1', 'E_3', 'F_3']:
