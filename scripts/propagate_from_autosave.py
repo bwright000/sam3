@@ -117,8 +117,13 @@ def assign_obj_ids(anchors: dict[int, dict[str, np.ndarray]],
 
 def build_coco(snippet, per_frame_per_cat: dict[int, dict[str, np.ndarray]],
                cat_to_objid: dict[str, int], min_area: int) -> dict:
-    """Re-uses storage.export_coco's layout logic but takes already-merged masks."""
-    from sam3_annotator.server.rle import mask_to_polygons
+    """Re-uses storage.export_coco's layout logic but takes already-merged masks.
+
+    Emits RLE in the segmentation field (COCO-native dict form). RLE is
+    lossless and preserves interior holes; the legacy polygon path used
+    cv2.RETR_EXTERNAL which silently dropped tissue-through-tool gaps.
+    """
+    from sam3_annotator.server.rle import mask_to_rle
 
     images_list: list[dict] = []
     ann_list: list[dict] = []
@@ -141,10 +146,8 @@ def build_coco(snippet, per_frame_per_cat: dict[int, dict[str, np.ndarray]],
             "width": snippet.width,
         })
         for cat, mask in per_frame_per_cat[fidx].items():
-            if int(mask.sum()) == 0:
-                continue
-            polys = mask_to_polygons(mask, min_area=min_area)
-            if not polys:
+            mask_area = int(mask.sum())
+            if mask_area < min_area:
                 continue
             ys, xs = np.where(mask > 0)
             bbox = [float(xs.min()), float(ys.min()),
@@ -153,9 +156,9 @@ def build_coco(snippet, per_frame_per_cat: dict[int, dict[str, np.ndarray]],
                 "id": ann_id,
                 "image_id": frame_num,
                 "category_id": cat_to_objid.get(cat, 0),
-                "segmentation": polys,
+                "segmentation": mask_to_rle(mask),
                 "bbox": bbox,
-                "area": float(mask.sum()),
+                "area": float(mask_area),
                 "iscrowd": 0,
             })
             ann_id += 1
