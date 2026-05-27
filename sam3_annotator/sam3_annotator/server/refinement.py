@@ -28,27 +28,32 @@ def preprocess_painted_mask(mask: np.ndarray, min_component_area: int = 100) -> 
         (default 100 — kills mouse-jitter dabs but preserves multi-instrument
         masks where the user paints two or more separate tools).
     Returns: (H, W) uint8 cleaned mask.
+
+    Previously included a 3×3 MORPH_CLOSE step to "seal brush gaps" — but
+    that also filled any intentional eraser hole ≤3 px wide before it could
+    reach the autosave. For surgical tool annotations where the user erases
+    fine holes (tissue visible through grasper joints, suture passages),
+    those holes must survive to disk. Now the mask is fed verbatim to the
+    component filter; any rendering smoothing happens downstream in SAM3
+    itself if relevant (and even there only via cond-frame reconstruction,
+    which the propagate-from-autosave re-seed compensates for).
     """
     if mask.dtype != np.uint8:
         mask = mask.astype(np.uint8)
     if mask.ndim != 2:
         raise ValueError(f"expected 2D mask, got shape {mask.shape}")
 
-    # 1. Seal brush gaps
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    # 2. Drop only TINY components (stray dabs). Keep everything else so users
+    # Drop only TINY components (stray dabs). Keep everything else so users
     # can paint multiple disjoint instruments under a single category.
-    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if n_labels <= 1:
-        return closed
+        return mask
 
-    keep = np.zeros_like(closed)
+    keep = np.zeros_like(mask)
     for i in range(1, n_labels):  # skip label 0 (background)
         if stats[i, cv2.CC_STAT_AREA] >= min_component_area:
             keep[labels == i] = 1
-    return keep if keep.sum() > 0 else closed  # fallback: keep everything if all CCs were tiny
+    return keep if keep.sum() > 0 else mask  # fallback: keep everything if all CCs were tiny
 
 
 def inpaint_specular_highlights(frame_rgb: np.ndarray, v_threshold: int = 245,
