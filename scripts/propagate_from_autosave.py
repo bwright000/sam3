@@ -257,9 +257,6 @@ def main():
     print("\nPreflight + bidirectional propagation…")
     objid_to_cat = {v: k for k, v in cat_to_objid.items()}
     per_frame: dict[int, dict[str, np.ndarray]] = {}
-    # Seed approved masks into the result so they survive the merge
-    for fidx, cats in anchors.items():
-        per_frame.setdefault(fidx, {}).update(cats)
 
     tracker.propagate_in_video_preflight(state, run_mem_encoder=True)
     t0 = time.time()
@@ -285,12 +282,22 @@ def main():
                 else:
                     mnp = ml
                 bm = (mnp > 0.0).astype(np.uint8)
-                # Approved mask wins where present
-                if cat in per_frame.get(fidx, {}) and fidx in anchors and cat in anchors[fidx]:
-                    continue
                 per_frame.setdefault(fidx, {})[cat] = bm
         print(f"  {direction}: {seen} frames")
     print(f"  propagated in {time.time() - t0:.1f}s")
+
+    # Re-seed approved anchor masks AFTER propagation, overwriting SAM3's
+    # cond-frame reconstruction. SAM3's mask decoder produces a smoothed
+    # reconstruction at every anchor frame (cond_frame_outputs.pred_masks),
+    # losing small interior holes (≤3 px) and sub-pixel boundary detail. The
+    # user-painted RLE in the autosave is the authoritative anchor — it must
+    # appear verbatim at the anchor frame in the output JSON. A pre-loop
+    # seed + in-loop guard was attempted but did not preserve the anchors
+    # reliably; an unconditional post-loop overwrite is the robust fix.
+    anchor_cells = sum(len(cats) for cats in anchors.values())
+    for fidx, cats in anchors.items():
+        per_frame.setdefault(fidx, {}).update(cats)
+    print(f"  re-seeded {anchor_cells} anchor cells (autosave wins at anchor frames)")
 
     # Build + write COCO
     coco = build_coco(snippet, per_frame, cat_to_objid, args.min_area)
