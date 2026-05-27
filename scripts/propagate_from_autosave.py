@@ -67,22 +67,71 @@ def rasterise_polygons(polygons: list[list[float]], h: int, w: int) -> np.ndarra
 
 def load_anchors(autosave: dict, snippet_h: int, snippet_w: int
                  ) -> dict[int, dict[str, np.ndarray]]:
-    """Return {frame_idx: {category: binary mask}}."""
+    """Return {frame_idx: {category: binary mask}}.
+
+    Prefers the lossless RLE round-trip (preserves interior holes that
+    cv2.RETR_EXTERNAL drops). Falls back to polygon rasterisation only if
+    the entry has no `rle` field (legacy autosaves written before the
+    annotator's RLE-first / slim-schema refactor).
+
+    Verbose diagnostics surface silent skip paths - the previous version
+    polygon-only and silently returned 0 anchors against an RLE-only
+    autosave, which made every snippet propagate as 'no anchors'.
+    """
+    rle_to_mask = None
+    try:
+        from sam3_annotator.server.rle import rle_to_mask as _r
+        rle_to_mask = _r
+    except Exception as e:
+        print(f"[load_anchors] WARN: cannot import rle_to_mask: {e!r}; "
+              f"RLE-only autosaves will produce zero anchors",
+              file=sys.stderr)
+
     out: dict[int, dict[str, np.ndarray]] = {}
     approved = autosave.get("approved_masks", {}) or {}
+    print(f"[load_anchors] approved_masks has {len(approved)} frame entries",
+          file=sys.stderr)
+    n_rle_decoded = 0
+    n_poly_decoded = 0
+    n_skipped_rle_fail = 0
+    n_skipped_no_data = 0
+    n_skipped_empty = 0
     for fidx_s, cats in approved.items():
         try:
             fidx = int(fidx_s)
         except (ValueError, TypeError):
             continue
         for cat, payload in cats.items():
-            polys = (payload or {}).get("polygons", []) if isinstance(payload, dict) else []
-            if not polys:
+            if not isinstance(payload, dict):
                 continue
-            mask = rasterise_polygons(polys, snippet_h, snippet_w)
-            if mask.sum() == 0:
+            mask = None
+            rle = payload.get("rle")
+            if rle is not None and rle_to_mask is not None:
+                try:
+                    mask = rle_to_mask(rle)
+                    n_rle_decoded += 1
+                except Exception as e:
+                    print(f"[load_anchors] f{fidx} {cat}: RLE decode raised "
+                          f"{type(e).__name__}: {e}", file=sys.stderr)
+                    mask = None
+                    n_skipped_rle_fail += 1
+            if mask is None:
+                polys = payload.get("polygons") or []
+                if not polys:
+                    n_skipped_no_data += 1
+                    continue
+                mask = rasterise_polygons(polys, snippet_h, snippet_w)
+                n_poly_decoded += 1
+            if mask is None or mask.sum() == 0:
+                n_skipped_empty += 1
                 continue
             out.setdefault(fidx, {})[cat] = mask
+    print(f"[load_anchors] decoded {n_rle_decoded} via RLE, {n_poly_decoded} "
+          f"via polygons; skipped {n_skipped_rle_fail} rle_fail, "
+          f"{n_skipped_no_data} no_data, {n_skipped_empty} empty",
+          file=sys.stderr)
+    print(f"[load_anchors] returning {sum(len(v) for v in out.values())} "
+          f"cells across {len(out)} frames", file=sys.stderr)
     return out
 
 
