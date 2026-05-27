@@ -520,8 +520,17 @@ def clean_dev_artefacts(sd: Path) -> dict:
 # Top-level orchestrator
 # ---------------------------------------------------------------------------
 
-def finalize(sd: Path) -> dict:
-    """Run the full publication-grade finalization on a snippet directory."""
+def finalize(sd: Path,
+             priority: tuple[str, ...] = ('Tool', 'Gallbladder', 'Liver')) -> dict:
+    """Run the full publication-grade finalization on a snippet directory.
+
+    `priority` is the category order (highest first) for hole-aware
+    polygon-priority resolution. Default Tool > Gallbladder > Liver is the
+    surgical-foreground rule. Override per-snippet when the masks were swept
+    to a different order (the resolution is hole-aware and near-no-op on
+    already-disjoint masks, but the order still governs which side wins any
+    sub-pixel boundary sliver introduced by the polygon round-trip).
+    """
     coco_p = sd / 'snippet_annotations.json'
     info_p = sd / 'info_semantic.json'
     intr_p = sd / 'intrinsics.yaml'
@@ -529,7 +538,8 @@ def finalize(sd: Path) -> dict:
     if not coco_p.is_file():
         return {'status': 'error', 'reason': f'no snippet_annotations.json at {coco_p}'}
 
-    result: dict = {'snippet': f'{sd.parent.name}/{sd.name}', 'steps': []}
+    result: dict = {'snippet': f'{sd.parent.name}/{sd.name}',
+                    'priority': list(priority), 'steps': []}
 
     # 1. Polygon repair
     t0 = time.time()
@@ -540,14 +550,15 @@ def finalize(sd: Path) -> dict:
         **repair_stats,
     })
 
-    # 2. Polygon-level priority resolution (Gallbladder > Liver > Tool).
-    # Clips Tool polygons that extend into tissue regions, and Liver polygons
-    # that extend into Gallbladder. Without this, snippet_annotations.json's
-    # polygons can disagree with semantic_instance/*.png on shape.
+    # 2. Hole-aware polygon-level priority resolution. `priority` lists cats
+    # highest-first; each lower cat is clipped against the (hole-aware) union
+    # of higher cats. Tissue showing through a tool's hole survives because
+    # the exclusion mask honours the higher cat's holes.
     t0 = time.time()
-    priority_stats = resolve_polygon_priority(coco)
+    priority_stats = resolve_polygon_priority(coco, priority=priority)
     result['steps'].append({
         'name': 'resolve_polygon_priority',
+        'priority': list(priority),
         'elapsed_s': round(time.time() - t0, 1),
         **priority_stats,
     })
@@ -603,9 +614,14 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--snippet-dir', type=Path, required=True)
+    ap.add_argument('--priority', nargs='+', default=['Tool', 'Gallbladder', 'Liver'],
+                    help="Category priority order, HIGHEST first, for hole-aware "
+                         "polygon-priority resolution. Default: Tool Gallbladder Liver "
+                         "(surgical-foreground rule). Pass e.g. "
+                         "--priority Gallbladder Liver Tool to match a different sweep.")
     args = ap.parse_args()
     try:
-        result = finalize(args.snippet_dir.resolve())
+        result = finalize(args.snippet_dir.resolve(), priority=tuple(args.priority))
     except Exception as e:
         print(f'ERROR: {type(e).__name__}: {e}', file=sys.stderr)
         traceback.print_exc()
